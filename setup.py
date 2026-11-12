@@ -113,5 +113,6 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "torch>=2.0.0",
+        "ninja",
     ],
 )

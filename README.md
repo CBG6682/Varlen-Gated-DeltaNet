@@ -99,6 +99,45 @@ Evaluated with sequence length $L = 1024$:
 
 ---
 
+## 📋 Requirements & Supported GPUs
+
+### 1. Supported GPUs (Turing SM75 with Tensor Cores)
+The CUDA kernels are specifically engineered for **NVIDIA Turing SM75** hardware:
+- **Cloud & Free-tier Environments**:
+  - **NVIDIA Tesla T4** (Default free GPU tier on **Google Colab** and **Kaggle**)
+- **Consumer Desktops & Laptops (GeForce RTX 20 Series)**:
+  - GeForce RTX 2080 Ti
+  - GeForce RTX 2080 Super / RTX 2080
+  - GeForce RTX 2070 Super / RTX 2070
+  - GeForce RTX 2060 Super / RTX 2060
+  - GeForce RTX 20-Series Mobile / Max-Q GPUs
+- **Professional & Workstation GPUs**:
+  - Quadro RTX 4000, Quadro RTX 5000, Quadro RTX 6000, Quadro RTX 8000
+- *Forward Compatibility*: Embedded `compute_75` PTX allows the binaries to be JIT-executed on newer GPUs (Ampere SM80/SM86, Ada SM89, Hopper SM90).
+
+### 2. Software Requirements (Before Compilation)
+Before building and compiling the extension, ensure your system provides:
+- **Operating System**: Linux (Ubuntu 20.04/22.04+, Debian, CentOS/RHEL)
+- **Python**: `>= 3.8` (recommended `3.10` or `3.11`)
+- **PyTorch**: `>= 2.0.0` with CUDA support (e.g. `torch >= 2.0.0+cu118` or `torch >= 2.1.0+cu121`)
+- **CUDA Toolkit**: `>= 11.8` or `12.x` (with `nvcc` compiler installed and accessible in `$PATH`)
+- **C++ Host Compiler**: `gcc` / `g++ >= 9.0` or `clang` supporting C++17
+- **Python Build Dependencies**:
+  ```bash
+  pip install -r requirements.txt
+  # or: pip install torch setuptools wheel ninja
+  ```
+  *(Installing `ninja` is strongly recommended for fast multi-threaded kernel compilation)*
+- **NVIDIA CUTLASS / CuTe**:
+  - Requires **CUTLASS >= 3.0** (specifically the header-only `<cute/tensor.hpp>`).
+  - **Automatic Handling**: `setup.py` automatically performs a shallow clone of CUTLASS (`git clone --depth 1 https://github.com/NVIDIA/cutlass.git`) into `./cutlass` during build if CUTLASS is not found on your system.
+  - **Custom CUTLASS Path (optional)**: If you already have CUTLASS installed locally, set:
+    ```bash
+    export CUTLASS_PATH=/path/to/cutlass
+    ```
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. Installation
@@ -210,6 +249,7 @@ Deltanet/
 ├── demo.ipynb                    # Interactive tutorial notebook for Colab / Kaggle
 ├── setup.py                      # Build script with auto-CUTLASS discovery
 ├── pyproject.toml                # PEP 517/518 build specification
+├── requirements.txt              # Build and runtime Python dependencies
 ├── LICENSE                       # Apache 2.0 License
 └── README.md
 ```

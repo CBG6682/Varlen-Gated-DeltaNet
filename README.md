@@ -3,11 +3,11 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-11.8%20%7C%2012.x-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-[![Hardware](https://img.shields.io/badge/GPU-SM75%20to%20SM90+-orange.svg)](https://developer.nvidia.com/cuda-gpus)
+[![Hardware](https://img.shields.io/badge/GPU-Turing%20SM75%20(Tesla%20T4)-orange.svg)](https://developer.nvidia.com/cuda-gpus)
 
 **DeltaNet v2** is a fast, hardware-optimized CUDA implementation of the DeltaNet linear attention mechanism featuring recurrent chunk-wise state updates (chunk WY representation), Grouped Query Attention (GQA), and multi-gate control (decay $\alpha$, erase $\beta$, write $W$, and L2 scaling $\gamma$).
 
-Implemented using **NVIDIA CUTLASS / CuTe**, DeltaNet v2 achieves high arithmetic intensity through fused Tensor Core MMA instructions (`SM75_16x8x8_F32F16F16F32_TN`), swizzled shared memory layouts (`Swizzle<3,3,3>`) for zero bank conflicts, register-level epilogues, and tight memory reuse.
+Implemented using **NVIDIA CUTLASS / CuTe**, DeltaNet v2 is specifically tailored for **NVIDIA Turing SM75** architecture (e.g. Tesla T4 GPUs on Google Colab and Kaggle) using fused Tensor Core MMA instructions (`SM75_16x8x8_F32F16F16F32_TN`), swizzled shared memory layouts (`Swizzle<3,3,3>`) for zero bank conflicts, register-level epilogues, and tight memory reuse.
 
 ---
 
@@ -181,11 +181,14 @@ out, states = compiled_model(x, cu_seqlens=cu_seqlens, use_kernel=True)
 | **Decode Step (L=1)** | `kernel_deltanet_infer` | `SM75_16x8x8_F32F16F16F32_TN` | Fused state read-modify-write, multi-head parallel |
 | **Backward Pass** | 3-kernel architecture | `LDSM_N`, `LDSM_T` | Recomputation of activations in SMEM, minimizing GMEM traffic |
 
-### Supported Hardware:
-- **NVIDIA Turing**: SM75 (T4, Quadro RTX 4000/5000/6000, RTX 2060-2080 Ti)
-- **NVIDIA Ampere**: SM80, SM86 (A100, RTX 3080/3090, A10G, A30)
-- **NVIDIA Ada Lovelace**: SM89 (RTX 4080/4090, L4, L40)
-- **NVIDIA Hopper**: SM90+ (H100, H200, B200)
+### Hardware Architecture:
+- **Primary Target**: **NVIDIA Turing SM75** (e.g. Tesla T4 on Google Colab / Kaggle, RTX 2060–2080 Ti, Quadro RTX).
+- **Microarchitecture Specification**:
+  - Kernels hardcode CuTe MMA atoms to **`SM75_16x8x8_F32F16F16F32_TN`** and S2R copy atoms to `SM75_U32x2_LDSM_N`, `SM75_U16x2_LDSM_T`.
+  - Block dimensions ($d_k = 64, d_v = 64, \text{chunk\_size} = 64$) and shared memory budgets (32 KB forward, 56.25 KB backward) are strictly tuned to fit within Turing's 64 KB shared memory per-block ceiling.
+- **Execution on Newer Architectures (Ampere SM80+, Ada SM89, Hopper SM90)**:
+  - Through PTX forward compatibility (`-gencode=arch=compute_75,code=compute_75`), the SM75 instruction sequence can be JIT-executed by the NVIDIA driver on newer GPUs.
+  - *Note*: It runs the SM75 $16 \times 8 \times 8$ Tensor Core instruction pipeline and does not use Ampere-specific $16 \times 8 \times 16$ MMA, asynchronous `cp.async`, or Hopper TMA.
 
 ---
 

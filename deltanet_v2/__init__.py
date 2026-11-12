@@ -1,7 +1,7 @@
 """
 DeltaNet v2: High-Performance Linear Attention CUDA Kernels & PyTorch Module.
 
-Optimized with NVIDIA CUTLASS / CuTe for Turing SM75, Ampere SM80/SM86, Ada SM89, and Hopper SM90+.
+Engineered with NVIDIA CUTLASS / CuTe specifically targeting Turing SM75 (Tesla T4).
 """
 
 from deltanet_v2.ops import (

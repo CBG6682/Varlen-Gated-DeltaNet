@@ -49,17 +49,12 @@ def get_cuda_arch_flags():
     if os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return []
 
-    # Auto-detect target GPU architecture if torch.cuda is available
-    arch_flags = []
-    if torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability()
-        arch_flags.append(f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}")
-    else:
-        # Standard default architectures: Turing (SM75), Ampere (SM80, SM86), Ada (SM89), Hopper (SM90)
-        for sm in [75, 80, 86, 89, 90]:
-            arch_flags.append(f"-gencode=arch=compute_{sm},code=sm_{sm}")
-
-    return arch_flags
+    # DeltaNet v2 kernels are specifically engineered with CuTe SM75 MMA atoms (16x8x8).
+    # We generate native SASS for sm_75 and embed compute_75 PTX for driver forward compatibility.
+    return [
+        "-gencode=arch=compute_75,code=sm_75",
+        "-gencode=arch=compute_75,code=compute_75",
+    ]
 
 
 cutlass_include = get_cutlass_include()

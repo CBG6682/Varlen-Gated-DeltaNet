@@ -10,36 +10,57 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def get_cutlass_include():
     """Locate or automatically clone NVIDIA CUTLASS repository."""
-    # 1. User-specified CUTLASS path
+    # 1. User-specified CUTLASS path via environment variable
     env_path = os.environ.get("CUTLASS_PATH")
     if env_path:
-        cand = os.path.join(env_path, "include") if not env_path.endswith("include") else env_path
-        if os.path.isdir(cand):
+        for cand in [os.path.join(env_path, "include"), env_path]:
+            if os.path.isfile(os.path.join(cand, "cute", "tensor.hpp")):
+                print(f"[setup.py] Found CUTLASS from CUTLASS_PATH: {cand}")
+                return os.path.abspath(cand)
+
+    # 2. Google Colab standard locations (/content/cutlass)
+    for colab_cand in [
+        "/content/cutlass/include",
+        "/content/cutlass",
+        "/content/Deltanet/cutlass/include",
+    ]:
+        if os.path.isfile(os.path.join(colab_cand, "cute", "tensor.hpp")):
+            print(f"[setup.py] Found CUTLASS in Colab path: {colab_cand}")
+            return os.path.abspath(colab_cand)
+
+    # 3. Local cutlass/ directory inside package
+    local_cands = [
+        os.path.join(THIS_DIR, "cutlass", "include"),
+        os.path.join(THIS_DIR, "cutlass"),
+        os.path.join(THIS_DIR, "..", "cutlass", "include"),
+    ]
+    for cand in local_cands:
+        if os.path.isfile(os.path.join(cand, "cute", "tensor.hpp")):
+            print(f"[setup.py] Found CUTLASS in local directory: {cand}")
             return os.path.abspath(cand)
 
-    # 2. Local cutlass/ directory
-    local_cand = os.path.join(THIS_DIR, "cutlass", "include")
-    if os.path.isdir(local_cand):
-        return os.path.abspath(local_cand)
-
-    # 3. Relative path inside parent development workspace (if applicable)
+    # 4. Relative path inside parent development workspace
     parent_cand = os.path.abspath(os.path.join(THIS_DIR, "../../../../cutlass/include"))
-    if os.path.isdir(parent_cand):
+    if os.path.isfile(os.path.join(parent_cand, "cute", "tensor.hpp")):
+        print(f"[setup.py] Found CUTLASS in parent workspace: {parent_cand}")
         return parent_cand
 
-    # 4. Automatically clone shallow CUTLASS repository
-    target_dir = os.path.join(THIS_DIR, "cutlass")
-    print("CUTLASS not found. Cloning NVIDIA CUTLASS (shallow clone)...")
+    # 5. Automatically shallow-clone CUTLASS if absent
+    target_dir = "/content/cutlass" if os.path.isdir("/content") else os.path.join(THIS_DIR, "cutlass")
+    print(f"[setup.py] CUTLASS (<cute/tensor.hpp>) not found. Shallow cloning NVIDIA CUTLASS to {target_dir}...")
     try:
         subprocess.run(
             ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", target_dir],
             check=True,
         )
-        if os.path.isdir(os.path.join(target_dir, "include")):
-            return os.path.abspath(os.path.join(target_dir, "include"))
+        for cand in [os.path.join(target_dir, "include"), target_dir]:
+            if os.path.isfile(os.path.join(cand, "cute", "tensor.hpp")):
+                print(f"[setup.py] Successfully cloned CUTLASS: {cand}")
+                return os.path.abspath(cand)
     except Exception as e:
-        print(f"Warning: Failed to clone CUTLASS automatically ({e}).")
+        print(f"[setup.py] Warning: Automatic git clone of CUTLASS failed: {e}")
 
+    # Fallback to local include
     return os.path.abspath(os.path.join(THIS_DIR, "include"))
 
 

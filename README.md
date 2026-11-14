@@ -241,7 +241,7 @@ The CUDA kernels are specifically engineered for **NVIDIA Turing SM75** hardware
 ### 2. Software Requirements (Before Compilation)
 Before building and compiling the extension, ensure your system provides:
 - **Operating System**: Linux x86_64 (Ubuntu 20.04/22.04+, Debian, CentOS/RHEL)
-- **Tested Python Versions**: **Python 3.12, 3.13** (Earlier versions such as Python 3.8–3.11 have not been tested).
+- **Supported Python Version**: **Python 3.13** only (tested on Linux x86_64 with PyTorch 2.6+ / 2.14+, CUDA 12.x / 13.0). Other versions (including Python 3.8–3.12) are not supported.
 - **PyTorch**: `>= 2.0.0` with CUDA support (tested on PyTorch 2.4, 2.6+, 2.14+ with CUDA 12.x / 13.0)
 - **CUDA Toolkit**: `>= 11.8` or `12.x` / `13.x` (with `nvcc` compiler installed and accessible in `$PATH`)
 - **C++ Host Compiler**: `gcc` / `g++ >= 10.0` supporting **C++20** (`-std=c++20`), with automatic fallback to **C++17** (`-std=c++17`)
@@ -267,7 +267,7 @@ Standalone pre-compiled `.whl` distributions are hosted on [GitHub Releases](htt
 
 | Wheel Package | Supported Environment Tuple (Python / PyTorch / CUDA / Arch) | SHA-256 Checksum |
 |:---|:---|:---|
-| [`deltanet_v2-2.0.0-py3-none-any.whl`](https://github.com/CBG6682/Varlen-Gated-DeltaNet/releases/download/v2.0.0/deltanet_v2-2.0.0-py3-none-any.whl) | Python 3.12 / 3.13, PyTorch 2.6+ / 2.14+, CUDA 12.x / 13.0, Linux x86_64 (SM75) | `5fa69c4364c78fe6be5a3a51bfe60a16afea4ac7b70f549b91057e48aedfc381` |
+| [`deltanet_v2-2.0.0-py3-none-any.whl`](https://github.com/CBG6682/Varlen-Gated-DeltaNet/releases/download/v2.0.0/deltanet_v2-2.0.0-py3-none-any.whl) | Python 3.13, PyTorch 2.6+ / 2.14+, CUDA 12.x / 13.0, Linux x86_64 (SM75) | `5fa69c4364c78fe6be5a3a51bfe60a16afea4ac7b70f549b91057e48aedfc381` |
 
 ```bash
 # Direct installation from GitHub Releases

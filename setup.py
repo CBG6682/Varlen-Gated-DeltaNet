@@ -222,7 +222,7 @@ setup(
     package_data={"deltanet_v2": ["*.so"]},
     ext_modules=ext_modules,
     cmdclass=cmdclass,
-    python_requires=">=3.8",
+    python_requires=">=3.13",
     install_requires=[
         "torch>=2.0.0",
         "ninja",

@@ -112,47 +112,73 @@ def get_cuda_arch_flags():
     ]
 
 
-cutlass_include = get_cutlass_include()
-include_dirs = [
-    os.path.join(THIS_DIR, "include"),
-    cutlass_include,
-]
+def get_existing_prebuilt():
+    """Find pre-compiled CUDA extension binary if present in deltanet_v2/."""
+    pkg_dir = os.path.join(THIS_DIR, "deltanet_v2")
+    if os.path.isdir(pkg_dir):
+        for f in os.listdir(pkg_dir):
+            if f.startswith("_C") and f.endswith(".so"):
+                return os.path.join(pkg_dir, f)
+    return None
 
-cxx_std = os.environ.get("CXX_STANDARD", "c++17")
 
-nvcc_flags = [
-    "-O3",
-    f"-std={cxx_std}",
-    "--use_fast_math",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_HALF2_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-] + get_cuda_arch_flags()
+# Compilation mode options:
+# 1. FORCE_REBUILD=1 or REBUILD=1: Force recompile from CUDA source and overwrite.
+# 2. Existing prebuilt found and no rebuild requested: Use existing binary (fast install).
+# 3. No prebuilt found: Default to compiling from source.
+force_rebuild = os.environ.get("FORCE_REBUILD", os.environ.get("REBUILD", "0")) in ("1", "true", "True")
+existing_prebuilt = get_existing_prebuilt()
 
-sources = [
-    os.path.join(THIS_DIR, "src", s)
-    for s in [
-        "binding.cpp",
-        "chunk_wy_fwd.cu",
-        "chunk_wy_bwd.cu",
-        "chunk_scan_fwd.cu",
-        "chunk_scan_bwd.cu",
-        "output_combine_fwd.cu",
-        "output_combine_bwd.cu",
-        "deltanet.cu",
-        "deltanet_infer.cu",
-    ]
-]
-
-use_prebuilt = os.environ.get("USE_PREBUILT", "0") == "1"
+if force_rebuild:
+    print("[setup.py] FORCE_REBUILD=1 requested: Recompiling CUDA extension from source...")
+    should_compile = True
+elif existing_prebuilt is not None:
+    print(f"[setup.py] Pre-compiled extension found: {os.path.basename(existing_prebuilt)}. Skipping compilation.")
+    print("[setup.py] (Set FORCE_REBUILD=1 to recompile from source).")
+    should_compile = False
+else:
+    print("[setup.py] No pre-compiled extension found. Defaulting to compile from source...")
+    should_compile = True
 
 ext_modules = []
 cmdclass = {}
 
-if not use_prebuilt:
+if should_compile:
+    cutlass_include = get_cutlass_include()
+    include_dirs = [
+        os.path.join(THIS_DIR, "include"),
+        cutlass_include,
+    ]
+
+    cxx_std = os.environ.get("CXX_STANDARD", "c++17")
+
+    nvcc_flags = [
+        "-O3",
+        f"-std={cxx_std}",
+        "--use_fast_math",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    ] + get_cuda_arch_flags()
+
+    sources = [
+        os.path.join(THIS_DIR, "src", s)
+        for s in [
+            "binding.cpp",
+            "chunk_wy_fwd.cu",
+            "chunk_wy_bwd.cu",
+            "chunk_scan_fwd.cu",
+            "chunk_scan_bwd.cu",
+            "output_combine_fwd.cu",
+            "output_combine_bwd.cu",
+            "deltanet.cu",
+            "deltanet_infer.cu",
+        ]
+    ]
+
     ext_modules = [
         CUDAExtension(
             name="deltanet_v2._C",
@@ -165,15 +191,13 @@ if not use_prebuilt:
         ),
     ]
     cmdclass = {"build_ext": BuildExtension}
-else:
-    print("[setup.py] USE_PREBUILT=1 detected: Skipping CUDA compilation and using existing pre-compiled _C extension.")
 
 setup(
     name="deltanet_v2",
     version="2.0.0",
     description="High-Performance DeltaNet v2 Linear Attention CUDA Kernels & PyTorch Module",
     author="CBG6682",
-    packages=find_packages(),
+    packages=find_packages(include=["deltanet_v2", "deltanet_v2.*"]),
     package_data={"deltanet_v2": ["*.so"]},
     ext_modules=ext_modules,
     cmdclass=cmdclass,

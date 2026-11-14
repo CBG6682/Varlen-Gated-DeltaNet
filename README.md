@@ -118,12 +118,12 @@ The CUDA kernels are specifically engineered for **NVIDIA Turing SM75** hardware
 ### 2. Software Requirements (Before Compilation)
 Before building and compiling the extension, ensure your system provides:
 - **Operating System**: Linux (Ubuntu 20.04/22.04+, Debian, CentOS/RHEL)
-- **Python**: `>= 3.8, <= 3.11` (**Python 3.10 strongly recommended**, particularly on Google Colab)
-- **PyTorch**: `>= 2.0.0, < 2.5.0` with CUDA support (e.g. `torch==2.4.1+cu121`)
+- **Python**: `>= 3.8, <= 3.11` (compatible with Google Colab container 2026.04 and earlier)
+- **PyTorch**: `>= 2.0.0, <= 2.5.x` with CUDA support (e.g. `torch >= 2.0.0+cu118` or `torch >= 2.1.0+cu121`)
 - **CUDA Toolkit**: `>= 11.8` or `12.x` (with `nvcc` compiler installed and accessible in `$PATH`)
 - **C++ Host Compiler**: `gcc` / `g++ >= 9.0` supporting **C++17** (`-std=c++17`)
-  > **Note on Python & C++ Standard**:
-  > DeltaNet v2 kernels and `setup.py` are built with **C++17** (`-std=c++17`). Bleeding-edge PyTorch 2.6+ (shipped by default with Python 3.13 on recent Colab environments) strictly requires C++20 and deprecates C++17 headers. For full ecosystem compatibility (including `flash-linear-attention` and Triton), **Python 3.10 with PyTorch 2.4.1** is the recommended configuration.
+  > **Note on Environment Compatibility**:
+  > DeltaNet v2 kernels and `setup.py` are engineered for **C++17** (`-std=c++17`) and are fully compatible with **Google Colab runtime / container versions 2026.04 and earlier** (Python 3.10 / 3.11, PyTorch $\le$ 2.5). No complex system library downgrades are needed.
 - **Python Build Dependencies**:
   ```bash
   pip install -r requirements.txt
@@ -144,22 +144,16 @@ Before building and compiling the extension, ensure your system provides:
 
 ### 1. Installation
 
-#### Option A (Recommended - Instant Setup in ~5s):
-Uses the pre-compiled Turing SM75 CUDA extension included directly in the repository (for Python 3.10 / Linux x86_64). Zero compilation time required:
-```bash
-git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
-cd Varlen-Gated-DeltaNet
-USE_PREBUILT=1 pip install -e . --no-build-isolation
-```
-
-#### Option B (Developer Mode - Recompile from source):
-Recompiles the CUDA kernels from source with C++17 (e.g. if you modified `src/` or `include/`, or target a different GPU architecture):
+#### Standard Installation from Source:
 ```bash
 git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
 cd Varlen-Gated-DeltaNet
+pip install ninja setuptools wheel einops
 MAX_JOBS=2 pip install . --no-build-isolation
 ```
-> **Note**: If NVIDIA CUTLASS is not found on your system, `setup.py` automatically initializes or shallow clones `third_party/cutlass`. No manual configuration needed.
+> **Build Options**:
+> - **Default**: If no pre-compiled binary is found in `deltanet_v2/`, `setup.py` automatically compiles CUDA kernels from source. If an existing `.so` is present, it will be reused immediately.
+> - **Force Rebuild**: Set `FORCE_REBUILD=1` (e.g. `FORCE_REBUILD=1 pip install . --no-build-isolation`) if you modified C++/CUDA code in `src/` or `include/` and want to overwrite.
 
 ---
 
@@ -242,40 +236,20 @@ The scripts measure both **latency (ms) / throughput (tokens/s)** and **peak VRA
 
 ### Running in Google Colab (Root `/content`)
 
-Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab or run directly in bash:
+Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab (compatible with container 2026.04 and earlier) or run directly in bash:
 
 ```bash
-# 0. Setup Python 3.10 & PyTorch 2.4.1 (C++17 environment)
-sudo apt-get update -q
-sudo apt-get install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa || true
-sudo apt-get update -q
-sudo apt-get install -y python3.10 python3.10-dev python3.10-distutils libpython3.10-dev
-sudo ln -sf /usr/bin/python3.10 /usr/local/bin/python
-sudo ln -sf /usr/bin/python3.10 /usr/local/bin/python3
-sudo ln -sf /usr/bin/python3.10 /usr/bin/python
-curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
-sudo ln -sf /usr/local/bin/pip /usr/bin/pip || true
-
-python -m pip install -q --upgrade pip setuptools wheel ninja einops
-python -m pip install -q torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# 1. Clone repository to /content/Deltanet
-git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
+# 1. Clone repository with dedicated third_party/cutlass submodule to /content/Deltanet
+git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
 cd /content/Deltanet
 
-# 2. Setup DeltaNet v2:
-# Option 2A (Instant, recommended): Use pre-compiled SM75 C-extension
-USE_PREBUILT=1 python -m pip install -q -e . --no-build-isolation
-
-# Option 2B (Developer Mode - only if you modified C++/CUDA kernels):
-# git submodule update --init --depth 1 third_party/cutlass || true
-# MAX_JOBS=2 python -m pip install -v . --no-build-isolation
-# cp build/lib.*/deltanet_v2/_C*.so deltanet_v2/ 2>/dev/null || true
+# 2. Install dependencies & DeltaNet v2 (MAX_JOBS=2 prevents Colab CPU/RAM crash)
+pip install ninja setuptools wheel einops
+MAX_JOBS=2 pip install . --no-build-isolation
 
 # 3. Install baselines
-python -m pip install -q flash-linear-attention
-python -m pip install -q git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps || true
+pip install flash-linear-attention
+pip install git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps || true
 
 # 4. Benchmark Single-Step Autoregressive Inference (L = 1)
 python /content/Deltanet/tests/bench_inference.py --dim 768 --batches 1,16,64,256,1024,2048
@@ -307,7 +281,6 @@ Deltanet/
 │   ├── deltanet.cu               # Forward & backward pipeline coordinators
 │   └── deltanet_infer.cu         # Fast single-step (L = 1) inference kernel
 ├── deltanet_v2/
-│   ├── _C.cpython-310-*.so       # Pre-compiled CUDA SM75 extension (Python 3.10)
 │   ├── __init__.py               # Package exports
 │   ├── ops.py                    # Op dispatcher, fake tensor registrations, autograd
 │   └── model.py                  # Full DeltaBlock PyTorch module

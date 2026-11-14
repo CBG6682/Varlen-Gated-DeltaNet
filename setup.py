@@ -72,6 +72,10 @@ def get_cutlass_include():
     target_dir = os.path.join(THIS_DIR, "third_party", "cutlass")
     print(f"[setup.py] CUTLASS (<cute/tensor.hpp>) not found. Shallow cloning to dedicated {target_dir}...")
     try:
+        if os.path.exists(target_dir) and not os.path.isfile(os.path.join(target_dir, "include", "cute", "tensor.hpp")):
+            import shutil
+            print(f"[setup.py] Removing unpopulated target directory before clone: {target_dir}")
+            shutil.rmtree(target_dir, ignore_errors=True)
         subprocess.run(
             ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", target_dir],
             check=True,

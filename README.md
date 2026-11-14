@@ -149,9 +149,9 @@ pip install git+https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
 
 #### From source:
 ```bash
-git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
+git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
 cd Varlen-Gated-DeltaNet
-pip install -e .
+pip install .
 ```
 > **Note**: If NVIDIA CUTLASS is not found on your system, `setup.py` automatically performs a shallow clone of CUTLASS. No manual clone or configuration needed.
 
@@ -245,7 +245,7 @@ cd /content/Deltanet
 
 # 2. Install dependencies & DeltaNet v2
 pip install ninja setuptools wheel einops
-pip install -e . --no-build-isolation
+pip install . --no-build-isolation
 
 # 3. Install baselines
 pip install flash-linear-attention

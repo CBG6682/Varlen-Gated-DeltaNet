@@ -1185,21 +1185,21 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
 // -----------------------------------------------------------------------------------------
 // Execution Flow Summary:
 // - Grid: (num_kv_heads, num_chunks), Block: 128 threads (4 warps).
-- Reads aggregated dD^T(j, i) matrix accumulated across query heads g by Kernel 1.
-- Computes dc_intra gradient:
-  * Stage 1: 2-Warp Scan computing intra-chunk c_t = cumsum(alpha) from gAlpha (FP16).
-  * Stage 2: Traverses 64x64 dD^T matrix in 4 steps (16 rows x 64 columns per step).
-    - Cache c_i (8 columns) in private thread registers r_c_i to avoid bank conflicts.
-    - For each causal pair (j, i) with i >= j:
+// - Reads aggregated dD^T(j, i) matrix accumulated across query heads g by Kernel 1.
+// - Computes dc_intra gradient:
+//   * Stage 1: 2-Warp Scan computing intra-chunk c_t = cumsum(alpha) from gAlpha (FP16).
+//   * Stage 2: Traverses 64x64 dD^T matrix in 4 steps (16 rows x 64 columns per step).
+//     - Cache c_i (8 columns) in private thread registers r_c_i to avoid bank conflicts.
+//     - For each causal pair (j, i) with i >= j:
 //       M_{ji} = dD^T(j, i) * exp(c_i - c_j)
-    - Warp reduction for row sum of row j across 8 threads of same row -> store into s_da_row[j].
-    - Accumulate col_da[k] across 4 steps and warp reduction across 4 rows in warp.
-    - Store into s_warp_col with column swizzle col ^ ((col >= 32) ? 4 : 0) to avoid bank conflicts.
-  * Stage 3: First 64 threads (tid < 64):
-    - Read s_warp_col with de-swizzle -> col_sum_t.
+//     - Warp reduction for row sum of row j across 8 threads of same row -> store into s_da_row[j].
+//     - Accumulate col_da[k] across 4 steps and warp reduction across 4 rows in warp.
+//     - Store into s_warp_col with column swizzle col ^ ((col >= 32) ? 4 : 0) to avoid bank conflicts.
+//   * Stage 3: First 64 threads (tid < 64):
+//     - Read s_warp_col with de-swizzle -> col_sum_t.
 //     - dc_intra = col_sum - row_sum.
-    - Read dc_inter from gDcTotal (written by Kernel 2).
-    - Overwrite in-place da_total = dc_intra + dc_inter into gDcTotal.
+//     - Read dc_inter from gDcTotal (written by Kernel 2).
+//     - Overwrite in-place da_total = dc_intra + dc_inter into gDcTotal.
 template <
     typename T,
     int NUM_THREADS,
@@ -1385,18 +1385,18 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_total(
 // Host Function: output_combine_bwd
 // -----------------------------------------------------------------------------------------
 // Execution Flow Summary:
-- Validates input tensors (contiguous, CUDA, valid shapes & dtypes, GQA compatibility).
-- Computes chunk offsets and valid lengths from cu_seq_lens.
-- Allocates output tensors: dq (FP16), dk_ext (FP16), dv_ext (FP16), da_ext (FP32), dS (FP16).
-- Allocates single intermediate buffer dD_buf (FP16) of shape (Hkv, num_chunks, 64, 64).
-  Replaces old intermediate buffers with direct in-kernel recomputation.
-- da_ext initialized to zeros: Kernel 2 writes dc_inter into da_ext; Kernel 3
-  reads dc_inter and overwrites da_total in-place into da_ext.
-- Launches 3 sequential kernels on CUDA stream:
-  1. Kernel 1: kernel_output_combine_dq_dk_dv (Grid: Hkv, num_chunks) - computes dq_intra, dk, dv, dD^T.
-  2. Kernel 2: kernel_output_combine_dc_inter_dS (Grid: Hkv, num_chunks) - dq_intra -> dq_total, dS, dc_inter.
-  3. Kernel 3: kernel_output_combine_dc_total (Grid: Hkv, num_chunks) - combines da_total = dc_intra + dc_inter.
-- Returns std::tuple: (dq, dk_ext, dv_ext, da_ext, dS).
+// - Validates input tensors (contiguous, CUDA, valid shapes & dtypes, GQA compatibility).
+// - Computes chunk offsets and valid lengths from cu_seq_lens.
+// - Allocates output tensors: dq (FP16), dk_ext (FP16), dv_ext (FP16), da_ext (FP32), dS (FP16).
+// - Allocates single intermediate buffer dD_buf (FP16) of shape (Hkv, num_chunks, 64, 64).
+//   Replaces old intermediate buffers with direct in-kernel recomputation.
+// - da_ext initialized to zeros: Kernel 2 writes dc_inter into da_ext; Kernel 3
+//   reads dc_inter and overwrites da_total in-place into da_ext.
+// - Launches 3 sequential kernels on CUDA stream:
+//   1. Kernel 1: kernel_output_combine_dq_dk_dv (Grid: Hkv, num_chunks) - computes dq_intra, dk, dv, dD^T.
+//   2. Kernel 2: kernel_output_combine_dc_inter_dS (Grid: Hkv, num_chunks) - dq_intra -> dq_total, dS, dc_inter.
+//   3. Kernel 3: kernel_output_combine_dc_total (Grid: Hkv, num_chunks) - combines da_total = dc_intra + dc_inter.
+// - Returns std::tuple: (dq, dk_ext, dv_ext, da_ext, dS).
 // Output Shapes:
 //   1. dq:     (num_q_heads, total_L, d_k) [FP16]
 //   2. dk_ext: (num_kv_heads, total_L, d_k) [FP16]

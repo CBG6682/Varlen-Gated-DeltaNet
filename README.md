@@ -26,8 +26,15 @@ This repository was created specifically to bridge that gap:
 
 ## ⚡ Highlights
 
-- **Up to 7.75x Faster Inference**: Reaches over **1,229,000 tokens/s** peak single-step decode throughput on Tesla T4 (vs 158,688 tokens/s in PyTorch reference, and nearly 2x faster than official open-source baselines).
-- **Up to 5.02x Faster Training**: Fused variable-length forward and backward recurrence with exact autograd support (22.96 ms step at $L=4096$ vs 115.32 ms in PyTorch reference and 63.25 ms in NVLabs).
+> **Hardware Evaluation Scope**: All benchmark and profiling results presented in this repository were evaluated strictly on an **NVIDIA Tesla T4 GPU (Turing SM75)**. Other GPU architectures (such as Ampere, Ada Lovelace, or Hopper) have not yet been evaluated.
+
+- **Outperforming Open-Source Baselines**:
+  - **~1.9x faster autoregressive decode** compared to official **NVLabs GatedDeltaNet-2** (1,229,778 tokens/s vs 652,358 tokens/s at $B = 2048$).
+  - **~2.75x faster training pass (forward + backward)** compared to **NVLabs GatedDeltaNet-2** (22.96 ms vs 63.25 ms per step at $L = 4096$).
+  - **~3.6x faster training pass (forward + backward)** compared to **Flash Linear Attention (FLA v1)** (22.96 ms vs 82.57 ms per step at $L = 4096$).
+- **Speedup vs Unfused PyTorch Reference**:
+  - **Up to 7.75x faster inference** single-step decode throughput vs un-fused PyTorch autograd baseline (1,229,778 vs 158,688 tokens/s).
+  - **Up to 5.02x faster training pass** vs un-fused PyTorch autograd baseline (22.96 ms vs 115.32 ms at $L = 4096$).
 - **2.0x Higher Batch Capacity**: Reduces peak activation and intermediate memory footprint, doubling max batch size before OOM.
 - **`torch.compile` Ready**: Built-in PyTorch Dispatcher integration with fake tensor registrations for seamless `torch.compile` compatibility.
 - **1-Command Setup**: Self-contained installation on Google Colab, Kaggle, and local GPU machines without external dependencies.
@@ -36,7 +43,7 @@ This repository was created specifically to bridge that gap:
 
 ## 📊 Benchmark Results
 
-All benchmarks were evaluated on an **NVIDIA Tesla T4 GPU (16 GB VRAM, SM75)** using **PyTorch 2.x**:
+All benchmarks were evaluated on an **NVIDIA Tesla T4 GPU (16 GB VRAM, SM75)** using **PyTorch 2.x** *(evaluated exclusively on Tesla T4; other GPU architectures have not been assessed)*:
 
 ---
 

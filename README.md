@@ -179,7 +179,7 @@ The following profile captures low-level kernel execution on an **NVIDIA Tesla T
 - **Hardware**: NVIDIA Tesla T4 (Turing Architecture, SM75, Compute Capability 7.5, 16 GB VRAM, Driver 580.82.07).
 - **Profiler Version**: NVIDIA Nsight Compute Command Line Profiler Version 2026.3.1.0 (build 38829034).
 - **Workload Shapes**:
-  - **Training Step (Forward + Backward)**: $B = 4$, $L = 1024$ (4,096 tokens total, variable-length packed with cumulative sequence offsets `cu_seqlens = [0, 1024, 2048, 3072, 4096]`), $H_q = 8$, $H_{kv} = 4$, $d_k = 64$, $d_v = 64$, $\text{chunk\_size} = 64$, $d_{\text{model}} = 768$.
+  - **Training Step (Forward + Backward)**: $B = 4$, $L = 1024$ (4,096 tokens total, variable-length packed with cumulative sequence offsets `cu_seqlens = [0, 1024, 2048, 3072, 4096]`), $H_q = 8$, $H_{kv} = 4$, $d_k = 64$, $d_v = 64$, $\text{chunk} = 64$, $d_{\text{model}} = 768$.
   - **Inference Step (Autoregressive Decode)**: $B = 128$, $L = 1$, $H_q = 8$, $H_{kv} = 4$, $d_k = 64$, $d_v = 64$, $d_{\text{model}} = 768$.
 - **Precision**: FP16 (`torch.float16`).
 - **Clock Frequency Note**: Nsight Compute fixes GPU core and memory clocks to deterministic base frequencies during profiling to ensure reproducible performance counter sampling; consequently, absolute kernel durations recorded by `ncu` differ from dynamic-clock wall-clock benchmarks.

@@ -385,6 +385,95 @@ def compute_deltanet_training_flops(
     return 3.0 * fwd_flops
 
 
+def compute_deltanet_inference_flops(
+    batch_size: int,
+    d_model: int = 768,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 8,
+    d_k: int = 64,
+    d_v: int = 64,
+) -> float:
+    """
+    Theoretical floating-point operations (FLOPs) for single-step autoregressive decode (L = 1)
+    of the pure Gated DeltaNet token mixer block (excluding MLP/FFW).
+    """
+    B = batch_size
+    Hq = num_q_heads
+    H = num_kv_heads
+    G = max(Hq // H, 1)
+    d_out_total = Hq * d_v
+
+    # Projections:
+    # W_proj: q (Hq*d_k), k (H*d_k), v (H*d_v), b (H*d_k), w (H*d_v), alpha (H), gamma (H)
+    d_proj_out = Hq * d_k + H * (d_k + 2 * d_v + d_k + 2)
+    flops_proj = 2.0 * B * d_model * d_proj_out
+    flops_gate = 2.0 * B * d_model * d_out_total
+    flops_out = 2.0 * B * d_out_total * d_model
+
+    # Recurrence update per step:
+    # S * q^T: [B, H, G, d_v]
+    flops_q_S = 2.0 * B * Hq * d_v * d_k
+    # S * u: [B, H, d_v]
+    flops_S_u = 2.0 * B * H * d_v * d_k
+    # q * k^T: [B, H, G]
+    flops_q_k = 2.0 * B * Hq * d_k
+    # attn * v_new: [B, H, G, d_v]
+    flops_attn_v = 2.0 * B * Hq * d_v
+    # State update: alpha * S + (v_new - S_u) * k^T
+    flops_state_update = 2.0 * B * H * d_v * d_k + 2.0 * B * H * d_v * d_k
+
+    # Elementwise ops (RMSNorm, silu, activations)
+    flops_elem = 10.0 * B * d_model
+
+    return (
+        flops_proj + flops_gate + flops_out
+        + flops_q_S + flops_S_u + flops_q_k + flops_attn_v + flops_state_update
+        + flops_elem
+    )
+
+
+def compute_deltanet_inference_memory_bytes(
+    batch_size: int,
+    d_model: int = 768,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 8,
+    d_k: int = 64,
+    d_v: int = 64,
+    dtype_bytes: int = 2,
+    state_bytes: int = 2,
+) -> float:
+    """
+    Theoretical minimum bytes transferred from DRAM (weights, activations, recurrent state)
+    during a single autoregressive decode step (L = 1).
+    """
+    B = batch_size
+    Hq = num_q_heads
+    H = num_kv_heads
+    d_out_total = Hq * d_v
+    d_proj_out = Hq * d_k + H * (d_k + 2 * d_v + d_k + 2)
+
+    # 1. Static weights (read once per step across all batch items)
+    # W_proj, W_gate, W_out, rms_norm
+    weights_elems = (
+        d_model * d_proj_out       # W_proj
+        + d_model * d_out_total    # W_gate
+        + d_out_total * d_model    # W_out
+        + d_out_total              # RMSNorm weight
+    )
+    weights_bytes = weights_elems * dtype_bytes
+
+    # 2. Input and output activations
+    # Read x, write y
+    act_bytes = 2.0 * B * d_model * dtype_bytes
+
+    # 3. Recurrent state memory traffic (KV cache equivalent)
+    # Read past_states [B, H, d_v, d_k], write next_states [B, H, d_v, d_k]
+    state_elems = 2.0 * B * H * d_v * d_k
+    state_traffic_bytes = state_elems * state_bytes
+
+    return float(weights_bytes + act_bytes + state_traffic_bytes)
+
+
 # =========================================================================
 # Table Formatting Utilities
 # =========================================================================

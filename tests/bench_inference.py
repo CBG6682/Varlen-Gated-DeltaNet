@@ -38,6 +38,8 @@ if ROOT_DIR not in sys.path:
 from deltanet_v2.model import DeltaBlock
 from tests.utils import (
     check_baseline_availability,
+    compute_deltanet_inference_flops,
+    compute_deltanet_inference_memory_bytes,
     format_markdown_table,
     get_device,
     measure_performance,
@@ -195,13 +197,40 @@ def run_inference_benchmark(
         "Method / Implementation",
         "Latency (ms)",
         "Throughput (tok/s)",
+        "GFLOPs",
+        "TFLOP/s",
+        "Memory (GB/s)",
         "Peak VRAM (MB)",
-        "Speedup (vs PyTorch)",
+        "Speedup",
     ]
     rows = []
 
     for B in tqdm(batch_sizes, desc="Inference Benchmark (Batch)", unit="batch"):
-        print(f"\n---> Benchmarking Batch Size B = {B} (L = 1) ...")
+        print(f"\n---> Benchmarking Batch Size B = {B} (L = 1) ...", flush=True)
+
+        # Theoretical FLOPs and Memory footprint for single-step decode (L = 1)
+        total_flops = compute_deltanet_inference_flops(
+            batch_size=B,
+            d_model=d_model,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            d_k=d_k,
+            d_v=d_v,
+        )
+        gflops = total_flops / 1e9
+
+        dtype_bytes = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+        total_bytes = compute_deltanet_inference_memory_bytes(
+            batch_size=B,
+            d_model=d_model,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            d_k=d_k,
+            d_v=d_v,
+            dtype_bytes=dtype_bytes,
+            state_bytes=2,
+        )
+
         x_step = torch.randn(B, 1, d_model, device=device, dtype=dtype)
         past_state = torch.zeros(B, num_kv_heads, d_v, d_k, device=device, dtype=torch.float16)
 
@@ -214,18 +243,24 @@ def run_inference_benchmark(
         ref_lat = res_ref["latency_ms"]
 
         if res_ref["status"] == "OK":
-            tok_s_ref = (B * 1000.0) / ref_lat
+            tok_s_ref = (B * 1000.0) / ref_lat if ref_lat > 0 else 0.0
+            tflops_ref = gflops / ref_lat if ref_lat > 0 else 0.0
+            mem_bw_ref = total_bytes / (ref_lat * 1e6) if ref_lat > 0 else 0.0
+            print(f"  ✓ PyTorch Reference: Lat={ref_lat:.3f}ms | {tok_s_ref:,.0f} tok/s | {tflops_ref:.2f} TFLOP/s | {mem_bw_ref:.1f} GB/s", flush=True)
             rows.append([
                 B,
                 "PyTorch Reference (Unfused)",
                 f"{ref_lat:.3f}",
                 f"{tok_s_ref:,.0f}",
+                f"{gflops:.3f}",
+                f"{tflops_ref:.2f}",
+                f"{mem_bw_ref:.1f}",
                 f"{res_ref['peak_alloc_mb']:.1f}",
                 "1.00x",
             ])
         else:
-            print(f"  [!] PyTorch Reference failed at B={B}: {res_ref.get('error_msg')}")
-            rows.append([B, "PyTorch Reference (Unfused)", res_ref["status"], "-", "-", "-"])
+            print(f"  ✗ PyTorch Reference failed at B={B}: {res_ref.get('error_msg')}", flush=True)
+            rows.append([B, "PyTorch Reference (Unfused)", res_ref["status"], "-", "-", "-", "-", "-", "-"])
 
         # Baseline B: FLA GatedDeltaNet (v1)
         if fla_gdn_block is not None:
@@ -238,19 +273,25 @@ def run_inference_benchmark(
             res_fla_gdn = measure_performance(run_fla_gdn, num_warmup, num_iters, device)
             if res_fla_gdn["status"] == "OK":
                 lat = res_fla_gdn["latency_ms"]
-                tok_s = (B * 1000.0) / lat
+                tok_s = (B * 1000.0) / lat if lat > 0 else 0.0
+                tflops = gflops / lat if lat > 0 else 0.0
+                mem_bw = total_bytes / (lat * 1e6) if lat > 0 else 0.0
                 sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
+                print(f"  ✓ FLA GDN (v1): Lat={lat:.3f}ms | {tok_s:,.0f} tok/s | {tflops:.2f} TFLOP/s | {mem_bw:.1f} GB/s", flush=True)
                 rows.append([
                     B,
                     "FLA GatedDeltaNet (v1)",
                     f"{lat:.3f}",
                     f"{tok_s:,.0f}",
+                    f"{gflops:.3f}",
+                    f"{tflops:.2f}",
+                    f"{mem_bw:.1f}",
                     f"{res_fla_gdn['peak_alloc_mb']:.1f}",
                     sp,
                 ])
             else:
-                print(f"  [!] FLA GatedDeltaNet (v1) notice at B={B}: {res_fla_gdn.get('error_msg')}")
-                rows.append([B, "FLA GatedDeltaNet (v1)", res_fla_gdn["status"], "-", "-", "-"])
+                print(f"  ✗ FLA GatedDeltaNet (v1) notice at B={B}: {res_fla_gdn.get('error_msg')}", flush=True)
+                rows.append([B, "FLA GatedDeltaNet (v1)", res_fla_gdn["status"], "-", "-", "-", "-", "-", "-"])
 
         # Baseline C: FLA GatedDeltaNet-2
         if fla_gdn2_block is not None:
@@ -263,19 +304,25 @@ def run_inference_benchmark(
             res_fla_gdn2 = measure_performance(run_fla_gdn2, num_warmup, num_iters, device)
             if res_fla_gdn2["status"] == "OK":
                 lat = res_fla_gdn2["latency_ms"]
-                tok_s = (B * 1000.0) / lat
+                tok_s = (B * 1000.0) / lat if lat > 0 else 0.0
+                tflops = gflops / lat if lat > 0 else 0.0
+                mem_bw = total_bytes / (lat * 1e6) if lat > 0 else 0.0
                 sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
+                print(f"  ✓ FLA GDN-2: Lat={lat:.3f}ms | {tok_s:,.0f} tok/s | {tflops:.2f} TFLOP/s | {mem_bw:.1f} GB/s", flush=True)
                 rows.append([
                     B,
                     "FLA GatedDeltaNet-2",
                     f"{lat:.3f}",
                     f"{tok_s:,.0f}",
+                    f"{gflops:.3f}",
+                    f"{tflops:.2f}",
+                    f"{mem_bw:.1f}",
                     f"{res_fla_gdn2['peak_alloc_mb']:.1f}",
                     sp,
                 ])
             else:
-                print(f"  [!] FLA GatedDeltaNet-2 notice at B={B}: {res_fla_gdn2.get('error_msg')}")
-                rows.append([B, "FLA GatedDeltaNet-2", res_fla_gdn2["status"], "-", "-", "-"])
+                print(f"  ✗ FLA GatedDeltaNet-2 notice at B={B}: {res_fla_gdn2.get('error_msg')}", flush=True)
+                rows.append([B, "FLA GatedDeltaNet-2", res_fla_gdn2["status"], "-", "-", "-", "-", "-", "-"])
 
         # Baseline D: NVLabs GatedDeltaNet-2 (Official NVIDIA)
         if nvlabs_gdn2_block is not None:
@@ -288,19 +335,25 @@ def run_inference_benchmark(
             res_nvlabs_gdn2 = measure_performance(run_nvlabs_gdn2, num_warmup, num_iters, device)
             if res_nvlabs_gdn2["status"] == "OK":
                 lat = res_nvlabs_gdn2["latency_ms"]
-                tok_s = (B * 1000.0) / lat
+                tok_s = (B * 1000.0) / lat if lat > 0 else 0.0
+                tflops = gflops / lat if lat > 0 else 0.0
+                mem_bw = total_bytes / (lat * 1e6) if lat > 0 else 0.0
                 sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
+                print(f"  ✓ NVLabs GDN-2: Lat={lat:.3f}ms | {tok_s:,.0f} tok/s | {tflops:.2f} TFLOP/s | {mem_bw:.1f} GB/s", flush=True)
                 rows.append([
                     B,
                     "NVLabs GatedDeltaNet-2",
                     f"{lat:.3f}",
                     f"{tok_s:,.0f}",
+                    f"{gflops:.3f}",
+                    f"{tflops:.2f}",
+                    f"{mem_bw:.1f}",
                     f"{res_nvlabs_gdn2['peak_alloc_mb']:.1f}",
                     sp,
                 ])
             else:
-                print(f"  [!] NVLabs GatedDeltaNet-2 notice at B={B}: {res_nvlabs_gdn2.get('error_msg')}")
-                rows.append([B, "NVLabs GatedDeltaNet-2", res_nvlabs_gdn2["status"], "-", "-", "-"])
+                print(f"  ✗ NVLabs GatedDeltaNet-2 notice at B={B}: {res_nvlabs_gdn2.get('error_msg')}", flush=True)
+                rows.append([B, "NVLabs GatedDeltaNet-2", res_nvlabs_gdn2["status"], "-", "-", "-", "-", "-", "-"])
 
         # Method: DeltaNet v2 (Ours - Fused CUDA Kernel)
         def run_ours():
@@ -310,19 +363,25 @@ def run_inference_benchmark(
         res_ours = measure_performance(run_ours, num_warmup, num_iters, device)
         if res_ours["status"] == "OK":
             lat = res_ours["latency_ms"]
-            tok_s = (B * 1000.0) / lat
+            tok_s = (B * 1000.0) / lat if lat > 0 else 0.0
+            tflops = gflops / lat if lat > 0 else 0.0
+            mem_bw = total_bytes / (lat * 1e6) if lat > 0 else 0.0
             sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
+            print(f"  ✓ DeltaNet v2 (Ours): Lat={lat:.3f}ms | {tok_s:,.0f} tok/s | {tflops:.2f} TFLOP/s | {mem_bw:.1f} GB/s", flush=True)
             rows.append([
                 B,
                 "**DeltaNet v2 (Ours)**",
                 f"**{lat:.3f}**",
                 f"**{tok_s:,.0f}**",
+                f"**{gflops:.3f}**",
+                f"**{tflops:.2f}**",
+                f"**{mem_bw:.1f}**",
                 f"**{res_ours['peak_alloc_mb']:.1f}**",
                 f"**{sp}**",
             ])
         else:
-            print(f"  [!] DeltaNet v2 (Ours) failed at B={B}: {res_ours.get('error_msg')}")
-            rows.append([B, "**DeltaNet v2 (Ours)**", res_ours["status"], "-", "-", "-"])
+            print(f"  ✗ DeltaNet v2 (Ours) failed at B={B}: {res_ours.get('error_msg')}", flush=True)
+            rows.append([B, "**DeltaNet v2 (Ours)**", res_ours["status"], "-", "-", "-", "-", "-", "-"])
 
         all_results.append({
             "B": B,

@@ -144,13 +144,13 @@ Before building and compiling the extension, ensure your system provides:
 
 #### Direct installation from GitHub (Google Colab / Kaggle / Local):
 ```bash
-pip install git+https://github.com/CBG6682/Deltanet.git
+pip install git+https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
 ```
 
 #### From source:
 ```bash
-git clone https://github.com/CBG6682/Deltanet.git
-cd Deltanet
+git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
+cd Varlen-Gated-DeltaNet
 pip install -e .
 ```
 > **Note**: If NVIDIA CUTLASS is not found on your system, `setup.py` automatically performs a shallow clone of CUTLASS. No manual clone or configuration needed.
@@ -240,7 +240,7 @@ Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab or run directly in bash:
 
 ```bash
 # 1. Clone repository to /content/Deltanet
-git clone https://github.com/CBG6682/Deltanet.git /content/Deltanet
+git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
 cd /content/Deltanet
 
 # 2. Install dependencies & DeltaNet v2

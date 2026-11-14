@@ -60,8 +60,8 @@ def run_training_benchmark(
     chunk_size: int = 64,
     batch_size: int = 4,
     seq_lens: Optional[List[int]] = None,
-    num_warmup: int = 10,
-    num_iters: int = 30,
+    num_warmup: int = 3,
+    num_iters: int = 10,
     use_short_conv: bool = False,
     dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
@@ -228,7 +228,25 @@ def run_training_benchmark(
         x_packed = x_batched.detach().reshape(total_tokens, d_model).clone().requires_grad_(True)
         cu_seqlens = torch.arange(0, (B + 1) * L, L, dtype=torch.int32, device=device)
 
-        total_iters = (num_warmup + num_iters) * 2
+        total_phase_iters = num_warmup + num_iters
+
+        def run_benchmark_phases(model_name: str, fn_fwd, fn_step):
+            print(f"  -> {model_name}: measuring Forward & Backward...", flush=True)
+            with tqdm(
+                total=total_phase_iters,
+                desc=f"L={L} | {model_name} (Fwd)",
+                leave=False,
+                dynamic_ncols=True,
+            ) as pbar:
+                res_fwd = measure_performance(fn_fwd, num_warmup, num_iters, device, pbar=pbar)
+            with tqdm(
+                total=total_phase_iters,
+                desc=f"L={L} | {model_name} (Fwd+Bwd)",
+                leave=False,
+                dynamic_ncols=True,
+            ) as pbar:
+                res_step = measure_performance(fn_step, num_warmup, num_iters, device, pbar=pbar)
+            return res_fwd, res_step
 
         # Baseline A: PyTorch Reference (Unfused autograd)
         def run_ref_fwd():
@@ -243,13 +261,12 @@ def run_training_benchmark(
             loss = out.sum()
             loss.backward()
 
-        with tqdm(total=total_iters, desc=f"L={L} | PyTorch Reference", leave=False) as pbar:
-            res_ref_fwd = measure_performance(run_ref_fwd, num_warmup, num_iters, device, pbar=pbar)
-            res_ref_step = measure_performance(run_ref_step, num_warmup, num_iters, device, pbar=pbar)
+        res_ref_fwd, res_ref_step = run_benchmark_phases("PyTorch Reference", run_ref_fwd, run_ref_step)
         ref_step_lat = res_ref_step["latency_ms"]
 
         if res_ref_step["status"] == "OK":
             tflops_ref = gflops / ref_step_lat if ref_step_lat > 0 else 0.0
+            print(f"     ✓ PyTorch Reference: Fwd={res_ref_fwd['latency_ms']:.2f}ms | Fwd+Bwd={ref_step_lat:.2f}ms | {tflops_ref:.2f} TFLOP/s", flush=True)
             rows.append([
                 L,
                 f"{total_tokens:,}",
@@ -262,7 +279,7 @@ def run_training_benchmark(
                 "1.00x",
             ])
         else:
-            print(f"  [!] PyTorch Reference failed at L={L}: {res_ref_step.get('error_msg')}")
+            print(f"     ✗ PyTorch Reference failed at L={L}: {res_ref_step.get('error_msg')}", flush=True)
             rows.append([L, f"{total_tokens:,}", "PyTorch Reference (Unfused)", "-", res_ref_step["status"], "-", "-", "-", "-"])
 
         # Baseline B: FLA GatedDeltaNet (v1)
@@ -279,14 +296,13 @@ def run_training_benchmark(
                 loss = out.sum()
                 loss.backward()
 
-            with tqdm(total=total_iters, desc=f"L={L} | FLA GDN (v1)", leave=False) as pbar:
-                res_fla_gdn_fwd = measure_performance(run_fla_gdn_fwd, num_warmup, num_iters, device, pbar=pbar)
-                res_fla_gdn_step = measure_performance(run_fla_gdn_step, num_warmup, num_iters, device, pbar=pbar)
+            res_fla_gdn_fwd, res_fla_gdn_step = run_benchmark_phases("FLA GDN (v1)", run_fla_gdn_fwd, run_fla_gdn_step)
 
             if res_fla_gdn_step["status"] == "OK":
                 lat = res_fla_gdn_step["latency_ms"]
                 tflops = gflops / lat if lat > 0 else 0.0
                 sp = f"{ref_step_lat / lat:.2f}x" if (ref_step_lat > 0 and lat > 0) else "-"
+                print(f"     ✓ FLA GDN (v1): Fwd={res_fla_gdn_fwd['latency_ms']:.2f}ms | Fwd+Bwd={lat:.2f}ms | {tflops:.2f} TFLOP/s", flush=True)
                 rows.append([
                     L,
                     f"{total_tokens:,}",
@@ -299,7 +315,7 @@ def run_training_benchmark(
                     sp,
                 ])
             else:
-                print(f"  [!] FLA GatedDeltaNet (v1) notice at L={L}: {res_fla_gdn_step.get('error_msg')}")
+                print(f"     ✗ FLA GatedDeltaNet (v1) notice at L={L}: {res_fla_gdn_step.get('error_msg')}", flush=True)
                 rows.append([L, f"{total_tokens:,}", "FLA GatedDeltaNet (v1)", "-", res_fla_gdn_step["status"], "-", "-", "-", "-"])
 
         # Baseline C: FLA GatedDeltaNet-2
@@ -316,14 +332,13 @@ def run_training_benchmark(
                 loss = out.sum()
                 loss.backward()
 
-            with tqdm(total=total_iters, desc=f"L={L} | FLA GDN2", leave=False) as pbar:
-                res_fla_gdn2_fwd = measure_performance(run_fla_gdn2_fwd, num_warmup, num_iters, device, pbar=pbar)
-                res_fla_gdn2_step = measure_performance(run_fla_gdn2_step, num_warmup, num_iters, device, pbar=pbar)
+            res_fla_gdn2_fwd, res_fla_gdn2_step = run_benchmark_phases("FLA GDN-2", run_fla_gdn2_fwd, run_fla_gdn2_step)
 
             if res_fla_gdn2_step["status"] == "OK":
                 lat = res_fla_gdn2_step["latency_ms"]
                 tflops = gflops / lat if lat > 0 else 0.0
                 sp = f"{ref_step_lat / lat:.2f}x" if (ref_step_lat > 0 and lat > 0) else "-"
+                print(f"     ✓ FLA GDN-2: Fwd={res_fla_gdn2_fwd['latency_ms']:.2f}ms | Fwd+Bwd={lat:.2f}ms | {tflops:.2f} TFLOP/s", flush=True)
                 rows.append([
                     L,
                     f"{total_tokens:,}",
@@ -336,7 +351,7 @@ def run_training_benchmark(
                     sp,
                 ])
             else:
-                print(f"  [!] FLA GatedDeltaNet-2 notice at L={L}: {res_fla_gdn2_step.get('error_msg')}")
+                print(f"     ✗ FLA GatedDeltaNet-2 notice at L={L}: {res_fla_gdn2_step.get('error_msg')}", flush=True)
                 rows.append([L, f"{total_tokens:,}", "FLA GatedDeltaNet-2", "-", res_fla_gdn2_step["status"], "-", "-", "-", "-"])
 
         # Baseline D: NVLabs GatedDeltaNet-2 (Official NVIDIA)
@@ -353,14 +368,13 @@ def run_training_benchmark(
                 loss = out.sum()
                 loss.backward()
 
-            with tqdm(total=total_iters, desc=f"L={L} | NVLabs GDN2", leave=False) as pbar:
-                res_nvlabs_gdn2_fwd = measure_performance(run_nvlabs_gdn2_fwd, num_warmup, num_iters, device, pbar=pbar)
-                res_nvlabs_gdn2_step = measure_performance(run_nvlabs_gdn2_step, num_warmup, num_iters, device, pbar=pbar)
+            res_nvlabs_gdn2_fwd, res_nvlabs_gdn2_step = run_benchmark_phases("NVLabs GDN-2", run_nvlabs_gdn2_fwd, run_nvlabs_gdn2_step)
 
             if res_nvlabs_gdn2_step["status"] == "OK":
                 lat = res_nvlabs_gdn2_step["latency_ms"]
                 tflops = gflops / lat if lat > 0 else 0.0
                 sp = f"{ref_step_lat / lat:.2f}x" if (ref_step_lat > 0 and lat > 0) else "-"
+                print(f"     ✓ NVLabs GDN-2: Fwd={res_nvlabs_gdn2_fwd['latency_ms']:.2f}ms | Fwd+Bwd={lat:.2f}ms | {tflops:.2f} TFLOP/s", flush=True)
                 rows.append([
                     L,
                     f"{total_tokens:,}",
@@ -373,7 +387,7 @@ def run_training_benchmark(
                     sp,
                 ])
             else:
-                print(f"  [!] NVLabs GatedDeltaNet-2 notice at L={L}: {res_nvlabs_gdn2_step.get('error_msg')}")
+                print(f"     ✗ NVLabs GatedDeltaNet-2 notice at L={L}: {res_nvlabs_gdn2_step.get('error_msg')}", flush=True)
                 rows.append([L, f"{total_tokens:,}", "NVLabs GatedDeltaNet-2", "-", res_nvlabs_gdn2_step["status"], "-", "-", "-", "-"])
 
         # Method: DeltaNet v2 (Ours - Fused CUDA Kernel)
@@ -389,14 +403,13 @@ def run_training_benchmark(
             loss = out.sum()
             loss.backward()
 
-        with tqdm(total=total_iters, desc=f"L={L} | DeltaNet v2 (Ours)", leave=False) as pbar:
-            res_ours_fwd = measure_performance(run_ours_fwd, num_warmup, num_iters, device, pbar=pbar)
-            res_ours_step = measure_performance(run_ours_step, num_warmup, num_iters, device, pbar=pbar)
+        res_ours_fwd, res_ours_step = run_benchmark_phases("DeltaNet v2 (Ours)", run_ours_fwd, run_ours_step)
         ours_step_lat = res_ours_step["latency_ms"]
 
         if res_ours_step["status"] == "OK":
             tflops_ours = gflops / ours_step_lat if ours_step_lat > 0 else 0.0
             sp = f"{ref_step_lat / ours_step_lat:.2f}x" if (ref_step_lat > 0 and ours_step_lat > 0) else "-"
+            print(f"     ✓ DeltaNet v2 (Ours): Fwd={res_ours_fwd['latency_ms']:.2f}ms | Fwd+Bwd={ours_step_lat:.2f}ms | {tflops_ours:.2f} TFLOP/s", flush=True)
             rows.append([
                 L,
                 f"{total_tokens:,}",
@@ -409,7 +422,7 @@ def run_training_benchmark(
                 f"**{sp}**",
             ])
         else:
-            print(f"  [!] DeltaNet v2 (Ours) failed at L={L}: {res_ours_step.get('error_msg')}")
+            print(f"     ✗ DeltaNet v2 (Ours) failed at L={L}: {res_ours_step.get('error_msg')}", flush=True)
             rows.append([L, f"{total_tokens:,}", "**DeltaNet v2 (Ours)**", "-", res_ours_step["status"], "-", "-", "-", "-"])
 
         all_results.append({
@@ -438,8 +451,8 @@ def parse_args():
     parser.add_argument("--chunk-size", type=int, default=64, help="Chunk size for WY representation")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size (B)")
     parser.add_argument("--seq-lens", type=str, default="512,1024,2048,4096", help="Comma-separated sequence lengths")
-    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations")
-    parser.add_argument("--iters", type=int, default=30, help="Number of timed iterations")
+    parser.add_argument("--warmup", type=int, default=3, help="Number of warmup iterations (default: 3)")
+    parser.add_argument("--iters", type=int, default=10, help="Number of timed iterations (default: 10)")
     parser.add_argument("--use-conv", action="store_true", help="Enable ShortConvolution in baselines (default: False)")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 instead of float16")
     parser.add_argument("--save-md", type=str, default=None, help="Save markdown table to file")

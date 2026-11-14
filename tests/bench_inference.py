@@ -58,8 +58,8 @@ def run_inference_benchmark(
     d_k: int = 64,
     d_v: int = 64,
     batch_sizes: Optional[List[int]] = None,
-    num_warmup: int = 15,
-    num_iters: int = 50,
+    num_warmup: int = 5,
+    num_iters: int = 20,
     use_short_conv: bool = False,
     dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
@@ -347,8 +347,8 @@ def parse_args():
     parser.add_argument("--d-k", type=int, default=64, help="Head dimension for Keys")
     parser.add_argument("--d-v", type=int, default=64, help="Head dimension for Values")
     parser.add_argument("--batches", type=str, default="1,16,64,256,1024,2048", help="Comma-separated batch sizes")
-    parser.add_argument("--warmup", type=int, default=15, help="Number of warmup iterations")
-    parser.add_argument("--iters", type=int, default=50, help="Number of timed iterations")
+    parser.add_argument("--warmup", type=int, default=5, help="Number of warmup iterations (default: 5)")
+    parser.add_argument("--iters", type=int, default=20, help="Number of timed iterations (default: 20)")
     parser.add_argument("--use-conv", action="store_true", help="Enable ShortConvolution in baselines (default: False)")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 instead of float16")
     parser.add_argument("--save-md", type=str, default=None, help="Save markdown table to file")

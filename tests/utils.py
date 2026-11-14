@@ -59,8 +59,8 @@ def print_hardware_info(device: Optional[torch.device] = None) -> None:
 
 def measure_performance(
     fn: Callable[[], Any],
-    num_warmup: int = 10,
-    num_iters: int = 30,
+    num_warmup: int = 3,
+    num_iters: int = 10,
     device: Optional[torch.device] = None,
     pbar: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -93,10 +93,16 @@ def measure_performance(
 
     try:
         # 1. Warm-up
-        for _ in range(num_warmup):
+        if pbar is not None and num_warmup > 0:
+            pbar.set_postfix_str("Compiling / Warmup...")
+            pbar.refresh()
+
+        for i in range(num_warmup):
             fn()
             if pbar is not None:
                 pbar.update(1)
+                pbar.set_postfix_str(f"Warmup {i + 1}/{num_warmup}")
+
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
@@ -105,15 +111,20 @@ def measure_performance(
             torch.cuda.reset_peak_memory_stats(device)
 
         # 2. Timing
+        if pbar is not None and num_iters > 0:
+            pbar.set_postfix_str("Benchmarking...")
+            pbar.refresh()
+
         if device.type == "cuda":
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
 
             start_event.record()
-            for _ in range(num_iters):
+            for it in range(num_iters):
                 fn()
                 if pbar is not None:
                     pbar.update(1)
+                    pbar.set_postfix_str(f"Timing {it + 1}/{num_iters}")
             end_event.record()
             torch.cuda.synchronize(device)
 
@@ -124,14 +135,19 @@ def measure_performance(
         else:
             import time
             t0 = time.perf_counter()
-            for _ in range(num_iters):
+            for it in range(num_iters):
                 fn()
                 if pbar is not None:
                     pbar.update(1)
+                    pbar.set_postfix_str(f"Timing {it + 1}/{num_iters}")
             total_ms = (time.perf_counter() - t0) * 1000.0
             latency_ms = total_ms / max(num_iters, 1)
             peak_alloc = 0.0
             peak_resv = 0.0
+
+        if pbar is not None:
+            pbar.set_postfix_str(f"{latency_ms:.2f} ms")
+            pbar.refresh()
 
         return {
             "latency_ms": latency_ms,
@@ -145,6 +161,12 @@ def measure_performance(
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        if pbar is not None:
+            remaining = getattr(pbar, "total", 0) - getattr(pbar, "n", 0)
+            if remaining > 0:
+                pbar.update(remaining)
+            pbar.set_postfix_str("OOM")
+            pbar.refresh()
         return {
             "latency_ms": float("nan"),
             "peak_alloc_mb": float("nan"),
@@ -156,6 +178,12 @@ def measure_performance(
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        if pbar is not None:
+            remaining = getattr(pbar, "total", 0) - getattr(pbar, "n", 0)
+            if remaining > 0:
+                pbar.update(remaining)
+            pbar.set_postfix_str("FAILED")
+            pbar.refresh()
         return {
             "latency_ms": float("nan"),
             "peak_alloc_mb": float("nan"),

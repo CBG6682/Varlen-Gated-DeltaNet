@@ -225,6 +225,44 @@ out, states = compiled_model(x, cu_seqlens=cu_seqlens, use_kernel=True)
 
 ---
 
+## 🔬 Benchmarking Against Baselines (NVLabs GatedDeltaNet-2 & FLA)
+
+A comprehensive benchmark suite is provided in [`tests/`](file:///tests) to compare DeltaNet v2 against:
+- **NVIDIA Official Baseline**: [`NVlabs/GatedDeltaNet-2`](https://github.com/nvlabs/gateddeltanet-2) (arXiv:2605.22791)
+- **Flash Linear Attention**: [`flash-linear-attention`](https://github.com/fla-org/flash-linear-attention) (`fla.layers.GatedDeltaNet2` & `fla.layers.GatedDeltaNet`)
+- **PyTorch Reference**: Unfused eager baseline
+
+The scripts measure both **latency (ms) / throughput (tokens/s)** and **peak VRAM consumption (allocated & reserved MB)**.
+
+### Running in Google Colab (Root `/content`)
+
+Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab or run directly in bash:
+
+```bash
+# 1. Clone repository to /content/Deltanet
+git clone https://github.com/CBG6682/Deltanet.git /content/Deltanet
+cd /content/Deltanet
+
+# 2. Install dependencies & DeltaNet v2
+pip install ninja setuptools wheel einops
+pip install -e . --no-build-isolation
+
+# 3. Install baselines
+pip install flash-linear-attention
+pip install git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps || true
+
+# 4. Benchmark Single-Step Autoregressive Inference (L = 1)
+python /content/Deltanet/tests/bench_inference.py --dim 768 --batches 1,16,64,256,1024,2048
+
+# 5. Benchmark Training Pass (Forward + Backward)
+python /content/Deltanet/tests/bench_training.py --dim 768 --batch-size 4 --seq-lens 512,1024,2048,4096
+
+# 6. Run All Benchmarks
+python /content/Deltanet/tests/bench_all.py
+```
+
+---
+
 ## 📂 Project Structure
 
 ```
@@ -246,7 +284,13 @@ Deltanet/
 │   ├── __init__.py               # Package exports
 │   ├── ops.py                    # Op dispatcher, fake tensor registrations, autograd
 │   └── model.py                  # Full DeltaBlock PyTorch module
-├── demo.ipynb                    # Interactive tutorial notebook for Colab / Kaggle
+├── tests/
+│   ├── utils.py                  # CUDA event timers, VRAM tracking, baseline loaders
+│   ├── bench_inference.py        # Autoregressive decode step (L = 1) benchmark
+│   ├── bench_training.py         # Forward + Backward training pass benchmark
+│   ├── bench_all.py              # Consolidated master benchmark runner
+│   └── test_correctness.py       # Numerical consistency verification vs PyTorch
+├── demo.ipynb                    # Colab / Kaggle runner notebook (/content)
 ├── setup.py                      # Build script with auto-CUTLASS discovery
 ├── pyproject.toml                # PEP 517/518 build specification
 ├── requirements.txt              # Build and runtime Python dependencies

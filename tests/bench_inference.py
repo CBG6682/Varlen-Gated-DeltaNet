@@ -10,7 +10,10 @@ to ensure direct and fair comparison of the recurrence kernels.
 import argparse
 import os
 import sys
+import warnings
 from typing import Any, Dict, List, Optional
+
+warnings.filterwarnings("ignore", message=".*ShortConvolution is crucial.*")
 
 import torch
 import torch.nn as nn

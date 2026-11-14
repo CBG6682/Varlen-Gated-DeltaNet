@@ -356,11 +356,13 @@ class DeltaBlock(nn.Module):
     def _forward_varlen(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         past_states: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if cu_seqlens is None:
+            cu_seqlens = torch.tensor([0, x.shape[0]], dtype=torch.int32, device=x.device)
         cu = cu_seqlens.tolist()
         num_seqs = len(cu) - 1
         H, G = self.num_kv_heads, self.num_groups
@@ -549,7 +551,7 @@ class DeltaBlock(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         past_states: Optional[torch.Tensor] = None,
         use_kernel: bool = False,
-        varlen: bool = True,
+        varlen: bool = False,
         seed: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -571,20 +573,15 @@ class DeltaBlock(nn.Module):
                 return self._forward_kernel(x, cu_seqlens, past_states, seed)
             return self._forward_infer_kernel(x, past_states)
 
-        if varlen:
+        is_step = (x.dim() == 2) or (x.dim() == 3 and x.shape[1] == 1)
+        if is_step and cu_seqlens is None and not self.training:
+            return self._forward_infer_ref(x, past_states)
+
+        if cu_seqlens is not None or varlen:
             return self._forward_varlen(
                 x=x, cu_seqlens=cu_seqlens, padding_mask=padding_mask,
                 past_states=past_states, seed=seed,
             )
-
-        if self.training:
-            return self._forward_batch(
-                x=x, padding_mask=padding_mask, past_states=past_states, seed=seed,
-            )
-
-        is_step = (x.dim() == 2) or (x.dim() == 3 and x.shape[1] == 1)
-        if is_step:
-            return self._forward_infer_ref(x, past_states)
 
         return self._forward_batch(
             x=x, padding_mask=padding_mask, past_states=past_states, seed=seed,

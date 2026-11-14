@@ -118,12 +118,12 @@ The CUDA kernels are specifically engineered for **NVIDIA Turing SM75** hardware
 ### 2. Software Requirements (Before Compilation)
 Before building and compiling the extension, ensure your system provides:
 - **Operating System**: Linux (Ubuntu 20.04/22.04+, Debian, CentOS/RHEL)
-- **Python**: `>= 3.8, <= 3.11` (compatible with Google Colab container 2026.04 and earlier)
-- **PyTorch**: `>= 2.0.0, <= 2.5.x` with CUDA support (e.g. `torch >= 2.0.0+cu118` or `torch >= 2.1.0+cu121`)
+- **Python**: `>= 3.8` (including Python 3.10, 3.11, 3.12, 3.13)
+- **PyTorch**: `>= 2.0.0` with CUDA support (e.g. `torch >= 2.1.0+cu121` or latest `torch >= 2.6.0`)
 - **CUDA Toolkit**: `>= 11.8` or `12.x` (with `nvcc` compiler installed and accessible in `$PATH`)
-- **C++ Host Compiler**: `gcc` / `g++ >= 9.0` supporting **C++17** (`-std=c++17`)
-  > **Note on Environment Compatibility**:
-  > DeltaNet v2 kernels and `setup.py` are engineered for **C++17** (`-std=c++17`) and are fully compatible with **Google Colab runtime / container versions 2026.04 and earlier** (Python 3.10 / 3.11, PyTorch $\le$ 2.5). No complex system library downgrades are needed.
+- **C++ Host Compiler**: `gcc` / `g++ >= 10.0` supporting **C++20** (`-std=c++20`), with automatic fallback to **C++17** (`-std=c++17`)
+  > **Note on C++ Standard & PyTorch Version**:
+  > By default, `setup.py` targets modern **C++20** (`-std=c++20`) required by PyTorch 2.6+. For older environments (e.g. Google Colab containers with PyTorch 2.0–2.5), set `CXX_STANDARD=c++17` to compile using C++17. The provided `demo.ipynb` notebook handles this fallback automatically.
 - **Python Build Dependencies**:
   ```bash
   pip install -r requirements.txt
@@ -236,7 +236,7 @@ The scripts measure both **latency (ms) / throughput (tokens/s)** and **peak VRA
 
 ### Running in Google Colab (Root `/content`)
 
-Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab (compatible with container 2026.04 and earlier) or run directly in bash:
+Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab (with automatic C++20 build and C++17 fallback) or run directly in bash:
 
 ```bash
 # 1. Clone repository with dedicated third_party/cutlass submodule to /content/Deltanet

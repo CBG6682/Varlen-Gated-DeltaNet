@@ -150,7 +150,7 @@ if should_compile:
         cutlass_include,
     ]
 
-    cxx_std = os.environ.get("CXX_STANDARD", "c++17")
+    cxx_std = os.environ.get("CXX_STANDARD", "c++20")
 
     nvcc_flags = [
         "-O3",

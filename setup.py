@@ -118,9 +118,11 @@ include_dirs = [
     cutlass_include,
 ]
 
+cxx_std = os.environ.get("CXX_STANDARD", "c++17")
+
 nvcc_flags = [
     "-O3",
-    "-std=c++20",
+    f"-std={cxx_std}",
     "--use_fast_math",
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
@@ -157,7 +159,7 @@ setup(
             sources=sources,
             include_dirs=include_dirs,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++20"],
+                "cxx": ["-O3", f"-std={cxx_std}"],
                 "nvcc": nvcc_flags,
             },
         ),

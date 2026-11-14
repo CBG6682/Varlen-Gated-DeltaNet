@@ -118,10 +118,12 @@ The CUDA kernels are specifically engineered for **NVIDIA Turing SM75** hardware
 ### 2. Software Requirements (Before Compilation)
 Before building and compiling the extension, ensure your system provides:
 - **Operating System**: Linux (Ubuntu 20.04/22.04+, Debian, CentOS/RHEL)
-- **Python**: `>= 3.8` (recommended `3.10` or `3.11`)
-- **PyTorch**: `>= 2.0.0` with CUDA support (e.g. `torch >= 2.0.0+cu118` or `torch >= 2.1.0+cu121`)
+- **Python**: `>= 3.8, <= 3.11` (**Python 3.10 strongly recommended**, particularly on Google Colab)
+- **PyTorch**: `>= 2.0.0, < 2.5.0` with CUDA support (e.g. `torch==2.4.1+cu121`)
 - **CUDA Toolkit**: `>= 11.8` or `12.x` (with `nvcc` compiler installed and accessible in `$PATH`)
-- **C++ Host Compiler**: `gcc` / `g++ >= 10.0` or `clang` supporting C++20 (as required by modern PyTorch 2.6+)
+- **C++ Host Compiler**: `gcc` / `g++ >= 9.0` supporting **C++17** (`-std=c++17`)
+  > **Note on Python & C++ Standard**:
+  > DeltaNet v2 kernels and `setup.py` are built with **C++17** (`-std=c++17`). Bleeding-edge PyTorch 2.6+ (shipped by default with Python 3.13 on recent Colab environments) strictly requires C++20 and deprecates C++17 headers. For full ecosystem compatibility (including `flash-linear-attention` and Triton), **Python 3.10 with PyTorch 2.4.1** is the recommended configuration.
 - **Python Build Dependencies**:
   ```bash
   pip install -r requirements.txt
@@ -239,17 +241,31 @@ The scripts measure both **latency (ms) / throughput (tokens/s)** and **peak VRA
 Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab or run directly in bash:
 
 ```bash
+# 0. Setup Python 3.10 & PyTorch 2.4.1 (C++17 environment)
+sudo apt-get update -q
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:deadsnakes/ppa || true
+sudo apt-get update -q
+sudo apt-get install -y python3.10 python3.10-dev python3.10-distutils libpython3.10-dev
+sudo ln -sf /usr/bin/python3.10 /usr/local/bin/python
+sudo ln -sf /usr/bin/python3.10 /usr/local/bin/python3
+sudo ln -sf /usr/bin/python3.10 /usr/bin/python
+curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+sudo ln -sf /usr/local/bin/pip /usr/bin/pip || true
+
+python -m pip install -q --upgrade pip setuptools wheel ninja einops
+python -m pip install -q torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 # 1. Clone repository with dedicated third_party/cutlass submodule to /content/Deltanet
 git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
 cd /content/Deltanet
 
-# 2. Install dependencies & DeltaNet v2 (MAX_JOBS=2 prevents Colab CPU/RAM crash)
-pip install ninja setuptools wheel einops
-MAX_JOBS=2 pip install . --no-build-isolation
+# 2. Compile DeltaNet v2 with C++17 (MAX_JOBS=2 prevents Colab CPU/RAM crash)
+MAX_JOBS=2 python -m pip install -v . --no-build-isolation
 
 # 3. Install baselines
-pip install flash-linear-attention
-pip install git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps || true
+python -m pip install -q flash-linear-attention
+python -m pip install -q git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps || true
 
 # 4. Benchmark Single-Step Autoregressive Inference (L = 1)
 python /content/Deltanet/tests/bench_inference.py --dim 768 --batches 1,16,64,256,1024,2048

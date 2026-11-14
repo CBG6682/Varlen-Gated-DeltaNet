@@ -7,6 +7,13 @@ import torch
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Limit maximum parallel compilation jobs to avoid memory exhaustion and crashes
+# on resource-constrained environments (e.g. Google Colab free tier with 2 vCPUs).
+# CuTe template expansion requires significant host RAM (~1.5-2.0 GB per worker).
+if "MAX_JOBS" not in os.environ:
+    os.environ["MAX_JOBS"] = "2"
+    print(f"[setup.py] Setting default MAX_JOBS={os.environ['MAX_JOBS']} to prevent CPU/RAM exhaustion")
+
 
 def get_cutlass_include():
     """Locate or automatically clone NVIDIA CUTLASS repository."""
@@ -113,7 +120,7 @@ include_dirs = [
 
 nvcc_flags = [
     "-O3",
-    "-std=c++17",
+    "-std=c++20",
     "--use_fast_math",
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
@@ -150,7 +157,7 @@ setup(
             sources=sources,
             include_dirs=include_dirs,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": ["-O3", "-std=c++20"],
                 "nvcc": nvcc_flags,
             },
         ),

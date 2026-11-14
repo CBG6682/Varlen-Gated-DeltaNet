@@ -121,7 +121,7 @@ Before building and compiling the extension, ensure your system provides:
 - **Python**: `>= 3.8` (recommended `3.10` or `3.11`)
 - **PyTorch**: `>= 2.0.0` with CUDA support (e.g. `torch >= 2.0.0+cu118` or `torch >= 2.1.0+cu121`)
 - **CUDA Toolkit**: `>= 11.8` or `12.x` (with `nvcc` compiler installed and accessible in `$PATH`)
-- **C++ Host Compiler**: `gcc` / `g++ >= 9.0` or `clang` supporting C++17
+- **C++ Host Compiler**: `gcc` / `g++ >= 10.0` or `clang` supporting C++20 (as required by modern PyTorch 2.6+)
 - **Python Build Dependencies**:
   ```bash
   pip install -r requirements.txt
@@ -243,9 +243,9 @@ Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab or run directly in bash:
 git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
 cd /content/Deltanet
 
-# 2. Install dependencies & DeltaNet v2
+# 2. Install dependencies & DeltaNet v2 (MAX_JOBS=2 prevents Colab CPU/RAM crash)
 pip install ninja setuptools wheel einops
-pip install . --no-build-isolation
+MAX_JOBS=2 pip install . --no-build-isolation
 
 # 3. Install baselines
 pip install flash-linear-attention

@@ -237,9 +237,12 @@ out, states = compiled_model(x, cu_seqlens=cu_seqlens, use_kernel=True)
 A comprehensive benchmark suite is provided in [`tests/`](file:///tests) to compare DeltaNet v2 against:
 - **NVIDIA Official Baseline**: [`NVlabs/GatedDeltaNet-2`](https://github.com/nvlabs/gateddeltanet-2) (arXiv:2605.22791)
 - **Flash Linear Attention**: [`flash-linear-attention`](https://github.com/fla-org/flash-linear-attention) (`fla.layers.GatedDeltaNet2` & `fla.layers.GatedDeltaNet`)
-- **PyTorch Reference**: Unfused eager baseline
+- **PyTorch Reference**: Pure PyTorch varlen implementation (`use_kernel=False, varlen=True`)
 
-The scripts measure both **latency (ms) / throughput (tokens/s)** and **peak VRAM consumption (allocated & reserved MB)**.
+Metrics evaluated:
+- **Inference (L = 1)**: Latency (ms), Generation Throughput (tokens/s), Peak VRAM (MB), Speedup.
+- **Training (Fwd + Bwd)**: Latency (ms), Floating-Point Operations (GFLOPs), Compute Throughput (TFLOP/s), Peak VRAM (MB), Speedup, and interactive `tqdm` progress bar.
+- **NCU Hardware Profiling**: Hardware HFMA/FFMA instruction counters and exact tensor core throughput using NVIDIA Nsight Compute (`ncu`).
 
 ### Running in Google Colab (Root `/content`)
 
@@ -250,22 +253,26 @@ Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab (with automatic C++20 bu
 git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
 cd /content/Deltanet
 
-# 2. Install dependencies & DeltaNet v2 (MAX_JOBS=2 prevents Colab CPU/RAM crash)
+# 2. Fast install via prebuilt wheel or build from source
 pip install ninja setuptools wheel einops
-MAX_JOBS=2 pip install . --no-build-isolation
+pip install wheels/*.whl || MAX_JOBS=2 pip install . --no-build-isolation
 
 # 3. Install baselines
-pip install flash-linear-attention
-pip install git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps || true
+pip install git+https://github.com/sustcsonglin/flash-linear-attention.git --no-build-isolation
+git clone --depth 1 https://github.com/NVlabs/GatedDeltaNet-2.git /content/gateddeltanet-2
+echo "# Standalone" > /content/gateddeltanet-2/lit_gpt/__init__.py
 
-# 4. Benchmark Single-Step Autoregressive Inference (L = 1)
+# 4. Numerical Correctness Sanity Test (Kernel Varlen vs PyTorch Varlen Reference)
+python /content/Deltanet/tests/test_correctness.py
+
+# 5. Benchmark Single-Step Autoregressive Inference (L = 1)
 python /content/Deltanet/tests/bench_inference.py --dim 768 --batches 1,16,64,256,1024,2048
 
-# 5. Benchmark Training Pass (Forward + Backward)
+# 6. Benchmark Training Pass (Forward + Backward) with GFLOPs and TFLOP/s
 python /content/Deltanet/tests/bench_training.py --dim 768 --batch-size 4 --seq-lens 512,1024,2048,4096
 
-# 6. Run All Benchmarks
-python /content/Deltanet/tests/bench_all.py
+# 7. Hardware Profiling with NVIDIA Nsight Compute (NCU)
+python /content/Deltanet/tests/profile_ncu.py --run-ncu --batch-size 4 --seq-len 2048
 ```
 
 ---

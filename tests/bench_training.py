@@ -1,7 +1,7 @@
 """
 Benchmark: Training Pass (Forward + Backward)
-Evaluates end-to-end training latency (ms/step), training throughput (tokens/sec), and peak VRAM.
-Compares DeltaNet v2 (SM75 CuTe fused kernel) against NVLabs GatedDeltaNet-2, FLA GatedDeltaNet-2, FLA GatedDeltaNet (v1), and PyTorch reference.
+Evaluates end-to-end training latency (ms/step), operation count (GFLOPs), compute throughput (TFLOP/s), and peak VRAM.
+Compares DeltaNet v2 fused CUDA kernel against NVLabs GatedDeltaNet-2, FLA GatedDeltaNet-2, FLA GatedDeltaNet (v1), and PyTorch reference.
 
 Benchmarks strictly the Gated DeltaNet token-mixer block (without MLP / FFW / SWA)
 to isolate and fairly evaluate the recurrence kernels.
@@ -15,6 +15,18 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable=None, *args, **kwargs):
+        if iterable is not None:
+            return iterable
+        class DummyPBar:
+            def update(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return DummyPBar()
+
 # Add project root to sys.path so scripts can run standalone from anywhere
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
@@ -23,6 +35,7 @@ if ROOT_DIR not in sys.path:
 from deltanet_v2.model import DeltaBlock
 from tests.utils import (
     check_baseline_availability,
+    compute_deltanet_training_flops,
     format_markdown_table,
     get_device,
     measure_performance,
@@ -181,21 +194,38 @@ def run_training_benchmark(
         "Method / Implementation",
         "Fwd (ms)",
         "Fwd+Bwd (ms)",
-        "Throughput (tok/s)",
+        "GFLOPs",
+        "TFLOP/s",
         "Peak VRAM (MB)",
         "Speedup",
     ]
     rows = []
 
     B = batch_size
-    for L in seq_lens:
+    seq_pbar = tqdm(seq_lens, desc="Training Benchmark (SeqLens)", unit="seq")
+    for L in seq_pbar:
         total_tokens = B * L
         print(f"\n---> Benchmarking B = {B}, L = {L} (Total Tokens: {total_tokens:,}) ...")
+
+        # Theoretical FLOPs for DeltaNet training step
+        total_flops = compute_deltanet_training_flops(
+            batch_size=B,
+            seq_len=L,
+            d_model=d_model,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            d_k=d_k,
+            d_v=d_v,
+            chunk_size=chunk_size,
+        )
+        gflops = total_flops / 1e9
 
         # Tensors
         x_batched = torch.randn(B, L, d_model, device=device, dtype=dtype, requires_grad=True)
         x_packed = x_batched.detach().reshape(total_tokens, d_model).clone().requires_grad_(True)
         cu_seqlens = torch.arange(0, (B + 1) * L, L, dtype=torch.int32, device=device)
+
+        total_iters = (num_warmup + num_iters) * 2
 
         # Baseline A: PyTorch Reference (Unfused autograd)
         def run_ref_fwd():
@@ -210,25 +240,27 @@ def run_training_benchmark(
             loss = out.sum()
             loss.backward()
 
-        res_ref_fwd = measure_performance(run_ref_fwd, num_warmup, num_iters, device)
-        res_ref_step = measure_performance(run_ref_step, num_warmup, num_iters, device)
+        with tqdm(total=total_iters, desc=f"L={L} | PyTorch Reference", leave=False) as pbar:
+            res_ref_fwd = measure_performance(run_ref_fwd, num_warmup, num_iters, device, pbar=pbar)
+            res_ref_step = measure_performance(run_ref_step, num_warmup, num_iters, device, pbar=pbar)
         ref_step_lat = res_ref_step["latency_ms"]
 
         if res_ref_step["status"] == "OK":
-            tok_s_ref = (total_tokens * 1000.0) / ref_step_lat
+            tflops_ref = gflops / ref_step_lat if ref_step_lat > 0 else 0.0
             rows.append([
                 L,
                 f"{total_tokens:,}",
                 "PyTorch Reference (Unfused)",
                 f"{res_ref_fwd['latency_ms']:.2f}",
                 f"{ref_step_lat:.2f}",
-                f"{tok_s_ref:,.0f}",
+                f"{gflops:.1f}",
+                f"{tflops_ref:.2f}",
                 f"{res_ref_step['peak_alloc_mb']:.1f}",
                 "1.00x",
             ])
         else:
             print(f"  [!] PyTorch Reference failed at L={L}: {res_ref_step.get('error_msg')}")
-            rows.append([L, f"{total_tokens:,}", "PyTorch Reference (Unfused)", "-", res_ref_step["status"], "-", "-", "-"])
+            rows.append([L, f"{total_tokens:,}", "PyTorch Reference (Unfused)", "-", res_ref_step["status"], "-", "-", "-", "-"])
 
         # Baseline B: FLA GatedDeltaNet (v1)
         if fla_gdn_block is not None:
@@ -244,12 +276,13 @@ def run_training_benchmark(
                 loss = out.sum()
                 loss.backward()
 
-            res_fla_gdn_fwd = measure_performance(run_fla_gdn_fwd, num_warmup, num_iters, device)
-            res_fla_gdn_step = measure_performance(run_fla_gdn_step, num_warmup, num_iters, device)
+            with tqdm(total=total_iters, desc=f"L={L} | FLA GDN (v1)", leave=False) as pbar:
+                res_fla_gdn_fwd = measure_performance(run_fla_gdn_fwd, num_warmup, num_iters, device, pbar=pbar)
+                res_fla_gdn_step = measure_performance(run_fla_gdn_step, num_warmup, num_iters, device, pbar=pbar)
 
             if res_fla_gdn_step["status"] == "OK":
                 lat = res_fla_gdn_step["latency_ms"]
-                tok_s = (total_tokens * 1000.0) / lat
+                tflops = gflops / lat if lat > 0 else 0.0
                 sp = f"{ref_step_lat / lat:.2f}x" if (ref_step_lat > 0 and lat > 0) else "-"
                 rows.append([
                     L,
@@ -257,13 +290,14 @@ def run_training_benchmark(
                     "FLA GatedDeltaNet (v1)",
                     f"{res_fla_gdn_fwd['latency_ms']:.2f}",
                     f"{lat:.2f}",
-                    f"{tok_s:,.0f}",
+                    f"{gflops:.1f}",
+                    f"{tflops:.2f}",
                     f"{res_fla_gdn_step['peak_alloc_mb']:.1f}",
                     sp,
                 ])
             else:
                 print(f"  [!] FLA GatedDeltaNet (v1) notice at L={L}: {res_fla_gdn_step.get('error_msg')}")
-                rows.append([L, f"{total_tokens:,}", "FLA GatedDeltaNet (v1)", "-", res_fla_gdn_step["status"], "-", "-", "-"])
+                rows.append([L, f"{total_tokens:,}", "FLA GatedDeltaNet (v1)", "-", res_fla_gdn_step["status"], "-", "-", "-", "-"])
 
         # Baseline C: FLA GatedDeltaNet-2
         if fla_gdn2_block is not None:
@@ -279,12 +313,13 @@ def run_training_benchmark(
                 loss = out.sum()
                 loss.backward()
 
-            res_fla_gdn2_fwd = measure_performance(run_fla_gdn2_fwd, num_warmup, num_iters, device)
-            res_fla_gdn2_step = measure_performance(run_fla_gdn2_step, num_warmup, num_iters, device)
+            with tqdm(total=total_iters, desc=f"L={L} | FLA GDN2", leave=False) as pbar:
+                res_fla_gdn2_fwd = measure_performance(run_fla_gdn2_fwd, num_warmup, num_iters, device, pbar=pbar)
+                res_fla_gdn2_step = measure_performance(run_fla_gdn2_step, num_warmup, num_iters, device, pbar=pbar)
 
             if res_fla_gdn2_step["status"] == "OK":
                 lat = res_fla_gdn2_step["latency_ms"]
-                tok_s = (total_tokens * 1000.0) / lat
+                tflops = gflops / lat if lat > 0 else 0.0
                 sp = f"{ref_step_lat / lat:.2f}x" if (ref_step_lat > 0 and lat > 0) else "-"
                 rows.append([
                     L,
@@ -292,13 +327,14 @@ def run_training_benchmark(
                     "FLA GatedDeltaNet-2",
                     f"{res_fla_gdn2_fwd['latency_ms']:.2f}",
                     f"{lat:.2f}",
-                    f"{tok_s:,.0f}",
+                    f"{gflops:.1f}",
+                    f"{tflops:.2f}",
                     f"{res_fla_gdn2_step['peak_alloc_mb']:.1f}",
                     sp,
                 ])
             else:
                 print(f"  [!] FLA GatedDeltaNet-2 notice at L={L}: {res_fla_gdn2_step.get('error_msg')}")
-                rows.append([L, f"{total_tokens:,}", "FLA GatedDeltaNet-2", "-", res_fla_gdn2_step["status"], "-", "-", "-"])
+                rows.append([L, f"{total_tokens:,}", "FLA GatedDeltaNet-2", "-", res_fla_gdn2_step["status"], "-", "-", "-", "-"])
 
         # Baseline D: NVLabs GatedDeltaNet-2 (Official NVIDIA)
         if nvlabs_gdn2_block is not None:
@@ -314,12 +350,13 @@ def run_training_benchmark(
                 loss = out.sum()
                 loss.backward()
 
-            res_nvlabs_gdn2_fwd = measure_performance(run_nvlabs_gdn2_fwd, num_warmup, num_iters, device)
-            res_nvlabs_gdn2_step = measure_performance(run_nvlabs_gdn2_step, num_warmup, num_iters, device)
+            with tqdm(total=total_iters, desc=f"L={L} | NVLabs GDN2", leave=False) as pbar:
+                res_nvlabs_gdn2_fwd = measure_performance(run_nvlabs_gdn2_fwd, num_warmup, num_iters, device, pbar=pbar)
+                res_nvlabs_gdn2_step = measure_performance(run_nvlabs_gdn2_step, num_warmup, num_iters, device, pbar=pbar)
 
             if res_nvlabs_gdn2_step["status"] == "OK":
                 lat = res_nvlabs_gdn2_step["latency_ms"]
-                tok_s = (total_tokens * 1000.0) / lat
+                tflops = gflops / lat if lat > 0 else 0.0
                 sp = f"{ref_step_lat / lat:.2f}x" if (ref_step_lat > 0 and lat > 0) else "-"
                 rows.append([
                     L,
@@ -327,15 +364,16 @@ def run_training_benchmark(
                     "NVLabs GatedDeltaNet-2",
                     f"{res_nvlabs_gdn2_fwd['latency_ms']:.2f}",
                     f"{lat:.2f}",
-                    f"{tok_s:,.0f}",
+                    f"{gflops:.1f}",
+                    f"{tflops:.2f}",
                     f"{res_nvlabs_gdn2_step['peak_alloc_mb']:.1f}",
                     sp,
                 ])
             else:
                 print(f"  [!] NVLabs GatedDeltaNet-2 notice at L={L}: {res_nvlabs_gdn2_step.get('error_msg')}")
-                rows.append([L, f"{total_tokens:,}", "NVLabs GatedDeltaNet-2", "-", res_nvlabs_gdn2_step["status"], "-", "-", "-"])
+                rows.append([L, f"{total_tokens:,}", "NVLabs GatedDeltaNet-2", "-", res_nvlabs_gdn2_step["status"], "-", "-", "-", "-"])
 
-        # Method: DeltaNet v2 (Ours - SM75 Fused CUDA Kernel)
+        # Method: DeltaNet v2 (Ours - Fused CUDA Kernel)
         def run_ours_fwd():
             with torch.no_grad():
                 return our_block(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
@@ -348,26 +386,28 @@ def run_training_benchmark(
             loss = out.sum()
             loss.backward()
 
-        res_ours_fwd = measure_performance(run_ours_fwd, num_warmup, num_iters, device)
-        res_ours_step = measure_performance(run_ours_step, num_warmup, num_iters, device)
+        with tqdm(total=total_iters, desc=f"L={L} | DeltaNet v2 (Ours)", leave=False) as pbar:
+            res_ours_fwd = measure_performance(run_ours_fwd, num_warmup, num_iters, device, pbar=pbar)
+            res_ours_step = measure_performance(run_ours_step, num_warmup, num_iters, device, pbar=pbar)
         ours_step_lat = res_ours_step["latency_ms"]
 
         if res_ours_step["status"] == "OK":
-            tok_s_ours = (total_tokens * 1000.0) / ours_step_lat
+            tflops_ours = gflops / ours_step_lat if ours_step_lat > 0 else 0.0
             sp = f"{ref_step_lat / ours_step_lat:.2f}x" if (ref_step_lat > 0 and ours_step_lat > 0) else "-"
             rows.append([
                 L,
                 f"{total_tokens:,}",
-                "**DeltaNet v2 (Ours - SM75 CuTe)**",
+                "**DeltaNet v2 (Ours)**",
                 f"**{res_ours_fwd['latency_ms']:.2f}**",
                 f"**{ours_step_lat:.2f}**",
-                f"**{tok_s_ours:,.0f}**",
+                f"**{gflops:.1f}**",
+                f"**{tflops_ours:.2f}**",
                 f"**{res_ours_step['peak_alloc_mb']:.1f}**",
                 f"**{sp}**",
             ])
         else:
             print(f"  [!] DeltaNet v2 (Ours) failed at L={L}: {res_ours_step.get('error_msg')}")
-            rows.append([L, f"{total_tokens:,}", "**DeltaNet v2 (Ours - SM75 CuTe)**", "-", res_ours_step["status"], "-", "-", "-"])
+            rows.append([L, f"{total_tokens:,}", "**DeltaNet v2 (Ours)**", "-", res_ours_step["status"], "-", "-", "-", "-"])
 
         all_results.append({
             "L": L,

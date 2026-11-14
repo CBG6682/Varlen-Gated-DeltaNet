@@ -7,6 +7,7 @@ with the pure PyTorch reference implementations.
 import argparse
 import os
 import sys
+from typing import List, Optional
 
 # Add project root to sys.path
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -74,16 +75,19 @@ def test_training_fwd_correctness(
     d_k: int = 64,
     d_v: int = 64,
     chunk_size: int = 64,
-    batch_size: int = 2,
-    seq_len: int = 256,
-    device: torch.device = None,
+    seq_lens: Optional[List[int]] = None,
+    device: Optional[torch.device] = None,
 ):
-    print("--> Checking Training Forward Pass Numerical Consistency...")
+    print("--> Checking Varlen Training Forward Pass Numerical Consistency...")
+    print("    Comparing: Kernel Varlen (use_kernel=True) vs Reference (use_kernel=False, varlen=True)...")
     if device is None:
         device = get_device()
     if device.type != "cuda":
         print("[!] Skipping CUDA kernel check (CUDA not available on this host).")
         return
+
+    if seq_lens is None:
+        seq_lens = [128, 256, 128]
 
     torch.manual_seed(42)
     block = DeltaBlock(
@@ -96,22 +100,35 @@ def test_training_fwd_correctness(
     ).to(device=device, dtype=torch.float16)
     block.eval()
 
-    total_tokens = batch_size * seq_len
-    x_batched = torch.randn(batch_size, seq_len, d_model, device=device, dtype=torch.float16)
-    x_packed = x_batched.reshape(total_tokens, d_model).clone()
-    cu_seqlens = torch.arange(0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device=device)
+    # Varlen cumulative sequence lengths
+    cu_list = [0]
+    for length in seq_lens:
+        cu_list.append(cu_list[-1] + length)
+    cu_seqlens = torch.tensor(cu_list, dtype=torch.int32, device=device)
+    total_tokens = cu_list[-1]
+    batch_size = len(seq_lens)
+
+    x_packed = torch.randn(total_tokens, d_model, device=device, dtype=torch.float16)
 
     with torch.no_grad():
-        out_ref, state_ref = block(x_batched, use_kernel=False)
+        out_ref, state_ref = block(x_packed, cu_seqlens=cu_seqlens, use_kernel=False, varlen=True)
         out_ker, state_ker = block(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
 
-    out_ref_flat = out_ref.reshape(total_tokens, d_model)
-    max_diff_out = (out_ref_flat - out_ker).abs().max().item()
-    cos_sim_out = F.cosine_similarity(out_ref_flat.flatten().float(), out_ker.flatten().float(), dim=0).item()
+    max_diff_out = (out_ref - out_ker).abs().max().item()
+    cos_sim_out = F.cosine_similarity(out_ref.flatten().float(), out_ker.flatten().float(), dim=0).item()
 
+    print(f"    Sequence Lengths: {seq_lens} (Total tokens: {total_tokens}, Batch: {batch_size})")
     print(f"    Output Tensor   : max_diff = {max_diff_out:.6f}, cos_sim = {cos_sim_out:.6f}")
+
+    if state_ref is not None and state_ker is not None:
+        if isinstance(state_ref, list):
+            state_ref = torch.stack(state_ref, dim=0)
+        max_diff_state = (state_ref - state_ker).abs().max().item()
+        cos_sim_state = F.cosine_similarity(state_ref.flatten().float(), state_ker.flatten().float(), dim=0).item()
+        print(f"    Recurrent State : max_diff = {max_diff_state:.6f}, cos_sim = {cos_sim_state:.6f}")
+
     if cos_sim_out > 0.99:
-        print("    [PASS] Training forward kernel matches PyTorch reference!\n")
+        print("    [PASS] Kernel varlen matches PyTorch varlen reference (use_kernel=False, varlen=True)!\n")
     else:
         print("    [!] Minor divergence observed (within expected FP16 accumulation tolerances).\n")
 

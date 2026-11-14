@@ -12,6 +12,18 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable=None, *args, **kwargs):
+        if iterable is not None:
+            return iterable
+        class DummyPBar:
+            def update(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return DummyPBar()
+
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
@@ -50,6 +62,7 @@ def measure_performance(
     num_warmup: int = 10,
     num_iters: int = 30,
     device: Optional[torch.device] = None,
+    pbar: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Measure average latency (ms) and peak VRAM usage (MB) using CUDA events and memory tracking.
@@ -59,6 +72,7 @@ def measure_performance(
         num_warmup: Number of untimed warmup iterations to initialize JIT, kernels, and caches.
         num_iters: Number of timed iterations to compute average latency.
         device: Target CUDA device.
+        pbar: Optional tqdm progress bar to advance upon completion of iterations.
 
     Returns:
         dict with keys:
@@ -81,6 +95,8 @@ def measure_performance(
         # 1. Warm-up
         for _ in range(num_warmup):
             fn()
+            if pbar is not None:
+                pbar.update(1)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
@@ -96,6 +112,8 @@ def measure_performance(
             start_event.record()
             for _ in range(num_iters):
                 fn()
+                if pbar is not None:
+                    pbar.update(1)
             end_event.record()
             torch.cuda.synchronize(device)
 
@@ -108,6 +126,8 @@ def measure_performance(
             t0 = time.perf_counter()
             for _ in range(num_iters):
                 fn()
+                if pbar is not None:
+                    pbar.update(1)
             total_ms = (time.perf_counter() - t0) * 1000.0
             latency_ms = total_ms / max(num_iters, 1)
             peak_alloc = 0.0
@@ -153,12 +173,10 @@ def try_import_nvlabs_gdn2():
     """
     Attempt to import GatedDeltaNet2 from official NVIDIA NVlabs repository.
     Searches installed lit_gpt package as well as clone locations.
+    Bypasses lit_gpt/__init__.py to prevent lightning/flash_attn dependency failures.
     """
-    try:
-        from lit_gpt.gdn2 import GatedDeltaNet2
-        return GatedDeltaNet2
-    except ImportError:
-        pass
+    if "lit_gpt.gdn2" in sys.modules:
+        return getattr(sys.modules["lit_gpt.gdn2"], "GatedDeltaNet2", None)
 
     candidates = [
         "/content/gateddeltanet-2",
@@ -168,14 +186,46 @@ def try_import_nvlabs_gdn2():
         os.path.join(ROOT_DIR, "gateddeltanet-2"),
         os.path.join(ROOT_DIR, "..", "gateddeltanet-2"),
     ]
+
+    import types
+
     for cand in candidates:
-        if os.path.isdir(cand) and cand not in sys.path:
-            sys.path.insert(0, cand)
+        lit_gpt_dir = os.path.join(cand, "lit_gpt")
+        gdn2_file = os.path.join(lit_gpt_dir, "gdn2.py")
+        if os.path.isdir(lit_gpt_dir) and os.path.isfile(gdn2_file):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+
+            # Pre-register dummy lit_gpt package to prevent __init__.py execution
+            # (which requires lightning>=2.1.0 and flash_attn)
+            if "lit_gpt" not in sys.modules:
+                pkg = types.ModuleType("lit_gpt")
+                pkg.__path__ = [lit_gpt_dir]
+                pkg.__file__ = os.path.join(lit_gpt_dir, "__init__.py")
+                sys.modules["lit_gpt"] = pkg
+
+            # Register dummy lit_gpt.gdn2_ops package for relative imports
+            ops_dir = os.path.join(lit_gpt_dir, "gdn2_ops")
+            if os.path.isdir(ops_dir) and "lit_gpt.gdn2_ops" not in sys.modules:
+                ops_pkg = types.ModuleType("lit_gpt.gdn2_ops")
+                ops_pkg.__path__ = [ops_dir]
+                ops_pkg.__file__ = os.path.join(ops_dir, "__init__.py")
+                sys.modules["lit_gpt.gdn2_ops"] = ops_pkg
+
             try:
-                from lit_gpt.gdn2 import GatedDeltaNet2
-                return GatedDeltaNet2
-            except ImportError:
+                import lit_gpt.gdn2 as gdn2_mod
+                cls = getattr(gdn2_mod, "GatedDeltaNet2", None)
+                if cls is not None:
+                    return cls
+            except Exception:
                 pass
+
+    try:
+        from lit_gpt.gdn2 import GatedDeltaNet2
+        return GatedDeltaNet2
+    except ImportError:
+        pass
+
     return None
 
 
@@ -246,7 +296,7 @@ def print_baseline_status() -> None:
     print("\n" + "=" * 72)
     print("BASELINE AVAILABILITY")
     print("=" * 72)
-    print(f"[-] DeltaNet v2 (Ours - SM75 CuTe)     : INSTALLED")
+    print(f"[-] DeltaNet v2 (Ours)                 : INSTALLED")
     print(f"[-] DeltaNet v2 (PyTorch Reference)    : INSTALLED")
     print(f"[-] NVLabs GatedDeltaNet-2 (Official)  : {'INSTALLED' if avail['nvlabs_gdn2'] else 'NOT FOUND'}")
     print(f"[-] FLA GatedDeltaNet-2 (FLA Library)  : {'INSTALLED' if avail['fla_gdn2'] else 'NOT FOUND'}")
@@ -256,8 +306,55 @@ def print_baseline_status() -> None:
         print("\n[!] Notice: External baselines can be installed via:")
         print("    rm -rf /content/gateddeltanet-2")
         print("    git clone --depth 1 https://github.com/NVlabs/GatedDeltaNet-2.git /content/gateddeltanet-2")
+        print("    echo \"\" > /content/gateddeltanet-2/lit_gpt/__init__.py")
         print("    pip install git+https://github.com/sustcsonglin/flash-linear-attention.git --no-build-isolation")
     print("=" * 72 + "\n")
+
+
+# =========================================================================
+# FLOP Counting Utilities
+# =========================================================================
+
+def compute_deltanet_training_flops(
+    batch_size: int,
+    seq_len: int,
+    d_model: int = 768,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 8,
+    d_k: int = 64,
+    d_v: int = 64,
+    chunk_size: int = 64,
+) -> float:
+    """
+    Theoretical floating-point operations (FLOPs) for a full Forward + Backward
+    training step of the pure Gated DeltaNet token mixer (excluding MLP/FFW).
+
+    FLOPs_total = 3 * FLOPs_fwd (Forward + Backward gradients w.r.t inputs & weights).
+    """
+    T = batch_size * seq_len
+    num_chunks = max(seq_len // chunk_size, 1)
+
+    # Input projection: [T, d_model] -> [T, d_proj_out]
+    # q, k, v, w, b, alpha, gamma
+    d_proj_out = num_q_heads * d_k + num_kv_heads * (d_k + 2 * d_v + d_k + 2)
+
+    fwd_proj = 2.0 * T * d_model * d_proj_out
+    fwd_gate = 2.0 * T * d_model * (num_q_heads * d_v)
+    fwd_out_proj = 2.0 * T * (num_q_heads * d_v) * d_model
+
+    # Chunk WY recurrence
+    fwd_wy = 2.0 * T * num_kv_heads * (d_k * d_k + d_v * d_k)
+    fwd_scan = 2.0 * batch_size * num_chunks * num_kv_heads * d_v * d_k * d_k
+    fwd_intra_attn = 2.0 * T * num_kv_heads * chunk_size * (d_k + d_v)
+    fwd_inter_attn = 2.0 * T * num_q_heads * d_k * d_v
+
+    fwd_elementwise = 10.0 * T * d_model
+    fwd_flops = (
+        fwd_proj + fwd_gate + fwd_out_proj
+        + fwd_wy + fwd_scan + fwd_intra_attn + fwd_inter_attn
+        + fwd_elementwise
+    )
+    return 3.0 * fwd_flops
 
 
 # =========================================================================

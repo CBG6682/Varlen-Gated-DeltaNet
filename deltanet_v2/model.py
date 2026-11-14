@@ -549,7 +549,7 @@ class DeltaBlock(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         past_states: Optional[torch.Tensor] = None,
         use_kernel: bool = False,
-        varlen: bool = False,
+        varlen: bool = True,
         seed: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -567,7 +567,7 @@ class DeltaBlock(nn.Module):
             seed: Optional seed for stochastic drop path reproducibility.
         """
         if use_kernel:
-            if self.training:
+            if cu_seqlens is not None or self.training:
                 return self._forward_kernel(x, cu_seqlens, past_states, seed)
             return self._forward_infer_kernel(x, past_states)
 

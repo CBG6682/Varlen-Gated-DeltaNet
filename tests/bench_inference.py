@@ -1,7 +1,7 @@
 """
 Benchmark: Single-Step Autoregressive Inference (L = 1)
 Evaluates decoding latency (ms/step), generation throughput (tokens/sec), and peak VRAM.
-Compares DeltaNet v2 (SM75 CuTe fused kernel) against NVLabs GatedDeltaNet-2, FLA GatedDeltaNet-2, FLA GatedDeltaNet (v1), and PyTorch reference.
+Compares DeltaNet v2 fused CUDA kernel against NVLabs GatedDeltaNet-2, FLA GatedDeltaNet-2, FLA GatedDeltaNet (v1), and PyTorch reference.
 
 Benchmarks strictly the Gated DeltaNet token-mixer block (without MLP / FFW / SWA)
 to ensure direct and fair comparison of the recurrence kernels.
@@ -14,6 +14,18 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable=None, *args, **kwargs):
+        if iterable is not None:
+            return iterable
+        class DummyPBar:
+            def update(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return DummyPBar()
 
 # Add project root to sys.path so scripts can run standalone from anywhere
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -185,7 +197,7 @@ def run_inference_benchmark(
     ]
     rows = []
 
-    for B in batch_sizes:
+    for B in tqdm(batch_sizes, desc="Inference Benchmark (Batch)", unit="batch"):
         print(f"\n---> Benchmarking Batch Size B = {B} (L = 1) ...")
         x_step = torch.randn(B, 1, d_model, device=device, dtype=dtype)
         past_state = torch.zeros(B, num_kv_heads, d_v, d_k, device=device, dtype=torch.float16)
@@ -287,7 +299,7 @@ def run_inference_benchmark(
                 print(f"  [!] NVLabs GatedDeltaNet-2 notice at B={B}: {res_nvlabs_gdn2.get('error_msg')}")
                 rows.append([B, "NVLabs GatedDeltaNet-2", res_nvlabs_gdn2["status"], "-", "-", "-"])
 
-        # Method: DeltaNet v2 (Ours - SM75 Fused CUDA Kernel)
+        # Method: DeltaNet v2 (Ours - Fused CUDA Kernel)
         def run_ours():
             with torch.no_grad():
                 return our_block(x_step, past_states=past_state, use_kernel=True)
@@ -299,7 +311,7 @@ def run_inference_benchmark(
             sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
             rows.append([
                 B,
-                "**DeltaNet v2 (Ours - SM75 CuTe)**",
+                "**DeltaNet v2 (Ours)**",
                 f"**{lat:.3f}**",
                 f"**{tok_s:,.0f}**",
                 f"**{res_ours['peak_alloc_mb']:.1f}**",
@@ -307,7 +319,7 @@ def run_inference_benchmark(
             ])
         else:
             print(f"  [!] DeltaNet v2 (Ours) failed at B={B}: {res_ours.get('error_msg')}")
-            rows.append([B, "**DeltaNet v2 (Ours - SM75 CuTe)**", res_ours["status"], "-", "-", "-"])
+            rows.append([B, "**DeltaNet v2 (Ours)**", res_ours["status"], "-", "-", "-"])
 
         all_results.append({
             "B": B,

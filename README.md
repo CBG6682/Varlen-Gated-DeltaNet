@@ -168,18 +168,18 @@ The following profile captures low-level kernel execution on an **NVIDIA Tesla T
 
 ![NVIDIA Nsight Compute Kernel Summary](assets/ncu_kernel_summary.png)
 
-#### Phân tích thiết kế kỹ thuật từ kết quả Nsight Compute:
+#### Kernel Architectural & Design Analysis from Nsight Compute:
 
-1. **Chấp nhận đánh đổi Occupancy để tối đa hóa tính toán trên Register File**:
-   - Thiết kế của các kernel DeltaNet v2 chủ động **đánh đổi giảm occupancy** (số block đồng thời trên mỗi Streaming Multiprocessor - SM) bằng cách cấp phát số lượng thanh ghi lớn (`# Registers` lên tới **180 – 244 registers/thread** trên các kernel chính như `kernel_output_combine_dc_inter_dS`, `kernel_chunk_wy_bwd`, `kernel_output_combine_dq_dk_dv`).
-   - Việc giữ toàn bộ các ma trận trạng thái tái diễn $S$ và các giá trị trung gian trực tiếp trên tệp thanh ghi (Register File - RF) giúp ALU và Tensor Cores đạt hiệu suất tính toán tối đa, **triệt tiêu hoàn toàn việc phải ghi các ma trận trung gian ra bộ nhớ toàn cục (DRAM/HBM)** và giảm thiểu tối đa số lần đọc/ghi bộ nhớ giữa các bước tính.
+1. **Trading Occupancy for Maximum Compute Intensity & Zero Intermediate DRAM Spills**:
+   - DeltaNet v2 kernels deliberately **trade away warp occupancy** (blocks per Streaming Multiprocessor — SM) by allocating large register budgets (**180 – 244 registers/thread** on compute-heavy fused kernels such as `kernel_output_combine_dc_inter_dS`, `kernel_chunk_wy_bwd`, and `kernel_output_combine_dq_dk_dv`).
+   - Retaining recurrent state tensors $S$ and intermediate reduction matrices directly on-chip within the thread Register File (RF) enables the ALU and Tensor Cores to sustain peak arithmetic throughput, **completely eliminating intermediate matrix round-trips to global memory (DRAM/HBM)** and drastically minimizing memory bandwidth pressure.
 
-2. **Lưu ý về chỉ số `Estimated Speedup [%]`**:
-   - Cột `Estimated Speedup [%]` hiển thị trong Nsight Compute chỉ là con số **ước lượng lý thuyết dựa trên mô hình Roofline** (Roofline Model Bound), không phải là hiệu năng có thể tối ưu thêm được trong thực tế của kernel.
+2. **Note on the `Estimated Speedup [%]` Metric**:
+   - The `Estimated Speedup [%]` column reported in Nsight Compute is a **theoretical Roofline model ceiling bound**, not a measure of unrealized or unoptimized real-world kernel performance.
 
-3. **Lý do một số kernel chưa đẩy tối đa Compute Throughput**:
-   - Các kernel có compute throughput đo được ở mức trung bình (ví dụ `kernel_output_combine_dq_dk_dv` hay `kernel_chunk_scan_bwd`) là **chủ đích thiết kế kỹ thuật**: 
-   - Các thao tác tính toán gradient đã được gộp lại (fused), chấp nhận độ trễ chờ nạp dữ liệu từ bộ nhớ và luân phiên nạp/ghi shared memory (SMEM ping-pong double buffering) nhằm tránh việc phải ghi lại các tensor gradient trung gian ra bộ nhớ toàn cục HBM/DRAM. Nhờ đó, tổng thời gian toàn bộ bước Forward + Backward giảm mạnh từ **115.32 ms xuống 22.96 ms** (nhanh hơn **5.02x**).
+3. **Sub-Peak Compute Throughput as an Intentional Fusion Trade-off**:
+   - Certain kernels exhibit moderate compute throughput (e.g. `kernel_output_combine_dq_dk_dv` and `kernel_chunk_scan_bwd`) as a **deliberate engineering design choice**:
+   - Fusing complex multi-step backward gradient evaluations introduces memory dependency wait states and alternating shared memory (SMEM ping-pong double buffering). This design intentionally trades peak instruction issue rate for **zero global DRAM spill-and-reload overhead**, ultimately reducing total forward + backward step time from **115.32 ms to 22.96 ms** (**5.02x faster**).
 
 ---
 

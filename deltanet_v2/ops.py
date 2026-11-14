@@ -10,44 +10,69 @@ import torch.nn.functional as F
 # 1. CUDA Extension / Shared Library Loading
 # =========================================================================
 _LIB_LOADED = False
+_LOAD_ERROR = None
 
 
 def _try_load_library():
-    global _LIB_LOADED
+    global _LIB_LOADED, _LOAD_ERROR
     if _LIB_LOADED:
         return True
 
     # 1. Check if already registered in PyTorch dispatcher
-    if hasattr(torch.ops, "deltanet") and hasattr(torch.ops.deltanet, "deltanet_fwd"):
+    if hasattr(torch.ops, "deltanet") and hasattr(torch.ops.deltanet, "chunk_wy_fwd"):
         _LIB_LOADED = True
+        _LOAD_ERROR = None
         return True
 
     # 2. Try importing compiled C extension module (deltanet_v2._C)
     try:
         from deltanet_v2 import _C
         _LIB_LOADED = True
+        _LOAD_ERROR = None
         return True
-    except (ImportError, ModuleNotFoundError):
+    except Exception as e:
+        _LOAD_ERROR = e
+
+    # 3. Search for compiled .so files in package directory, site-packages, or build folders
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+
+    # Local package directory
+    if os.path.isdir(pkg_dir):
+        candidates += [
+            os.path.join(pkg_dir, f) for f in os.listdir(pkg_dir) if f.endswith(".so")
+        ]
+
+    # Build directories
+    candidates += glob.glob(os.path.join(pkg_dir, "..", "build", "*", "*.so"))
+    candidates += glob.glob(os.path.join(pkg_dir, "..", "build", "*", "*", "*.so"))
+    candidates += glob.glob(os.path.join(pkg_dir, "..", "*.so"))
+
+    # Installed site-packages / dist-packages
+    try:
+        import site
+        sp_dirs = site.getsitepackages() if hasattr(site, "getsitepackages") else []
+        if hasattr(site, "getusersitepackages"):
+            sp_dirs = list(sp_dirs) + [site.getusersitepackages()]
+        for sp in sp_dirs:
+            candidates += glob.glob(os.path.join(sp, "deltanet_v2", "*.so"))
+            candidates += glob.glob(os.path.join(sp, "*deltanet_v2*.so"))
+    except Exception:
         pass
 
-    # 3. Search for compiled .so files in package directory or build folders
-    pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = (
-        glob.glob(os.path.join(pkg_dir, "*.so"))
-        + glob.glob(os.path.join(pkg_dir, "..", "build", "*", "*.so"))
-        + glob.glob(os.path.join(pkg_dir, "..", "*.so"))
-    )
-
     for so_path in candidates:
-        try:
-            torch.ops.load_library(os.path.abspath(so_path))
-            if hasattr(torch.ops, "deltanet") and hasattr(torch.ops.deltanet, "deltanet_fwd"):
-                _LIB_LOADED = True
-                return True
-        except Exception:
-            continue
+        if os.path.isfile(so_path):
+            try:
+                torch.ops.load_library(os.path.abspath(so_path))
+                if hasattr(torch.ops, "deltanet") and hasattr(torch.ops.deltanet, "chunk_wy_fwd"):
+                    _LIB_LOADED = True
+                    _LOAD_ERROR = None
+                    return True
+            except Exception as e:
+                _LOAD_ERROR = e
+                continue
 
-    return False
+    return _LIB_LOADED
 
 
 _try_load_library()
@@ -56,7 +81,13 @@ _try_load_library()
 # =========================================================================
 # 2. PyTorch Fake Tensor / Meta Registrations (for torch.compile / Dynamo)
 # =========================================================================
-if hasattr(torch, "library") and hasattr(torch.library, "register_fake"):
+if (
+    _LIB_LOADED
+    and hasattr(torch.ops, "deltanet")
+    and hasattr(torch.ops.deltanet, "chunk_wy_fwd")
+    and hasattr(torch, "library")
+    and hasattr(torch.library, "register_fake")
+):
 
     @torch.library.register_fake("deltanet::chunk_wy_fwd")
     def _chunk_wy_fwd_fake(k, v, b, w, gamma, a, cu_seq_lens, chunk_size=64):
@@ -150,12 +181,15 @@ class _CustomOpsProxy:
             from deltanet_v2 import _C
             if hasattr(_C, name):
                 return getattr(_C, name)
-        except ImportError:
+        except Exception:
             pass
-        raise AttributeError(
+        err_msg = (
             f"DeltaNet op '{name}' not found. Please ensure the CUDA extension is compiled "
             f"via 'pip install .' or 'python setup.py build_ext --inplace'."
         )
+        if _LOAD_ERROR is not None:
+            err_msg += f" (Underlying loader error: {_LOAD_ERROR})"
+        raise RuntimeError(err_msg)
 
 
 custom_ops = _CustomOpsProxy()

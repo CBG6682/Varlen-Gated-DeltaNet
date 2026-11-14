@@ -3,6 +3,7 @@ build/
 dist/
 *.egg-info/
 *.so
+!deltanet_v2/_C*.so
 *.o
 *.a
 

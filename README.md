@@ -144,18 +144,22 @@ Before building and compiling the extension, ensure your system provides:
 
 ### 1. Installation
 
-#### Direct installation from GitHub (Google Colab / Kaggle / Local):
+#### Option A (Recommended - Instant Setup in ~5s):
+Uses the pre-compiled Turing SM75 CUDA extension included directly in the repository (for Python 3.10 / Linux x86_64). Zero compilation time required:
 ```bash
-pip install git+https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
+git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
+cd Varlen-Gated-DeltaNet
+USE_PREBUILT=1 pip install -e . --no-build-isolation
 ```
 
-#### From source:
+#### Option B (Developer Mode - Recompile from source):
+Recompiles the CUDA kernels from source with C++17 (e.g. if you modified `src/` or `include/`, or target a different GPU architecture):
 ```bash
 git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
 cd Varlen-Gated-DeltaNet
-pip install .
+MAX_JOBS=2 pip install . --no-build-isolation
 ```
-> **Note**: If NVIDIA CUTLASS is not found on your system, `setup.py` automatically performs a shallow clone of CUTLASS. No manual clone or configuration needed.
+> **Note**: If NVIDIA CUTLASS is not found on your system, `setup.py` automatically initializes or shallow clones `third_party/cutlass`. No manual configuration needed.
 
 ---
 
@@ -256,12 +260,18 @@ sudo ln -sf /usr/local/bin/pip /usr/bin/pip || true
 python -m pip install -q --upgrade pip setuptools wheel ninja einops
 python -m pip install -q torch==2.4.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 1. Clone repository with dedicated third_party/cutlass submodule to /content/Deltanet
-git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
+# 1. Clone repository to /content/Deltanet
+git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
 cd /content/Deltanet
 
-# 2. Compile DeltaNet v2 with C++17 (MAX_JOBS=2 prevents Colab CPU/RAM crash)
-MAX_JOBS=2 python -m pip install -v . --no-build-isolation
+# 2. Setup DeltaNet v2:
+# Option 2A (Instant, recommended): Use pre-compiled SM75 C-extension
+USE_PREBUILT=1 python -m pip install -q -e . --no-build-isolation
+
+# Option 2B (Developer Mode - only if you modified C++/CUDA kernels):
+# git submodule update --init --depth 1 third_party/cutlass || true
+# MAX_JOBS=2 python -m pip install -v . --no-build-isolation
+# cp build/lib.*/deltanet_v2/_C*.so deltanet_v2/ 2>/dev/null || true
 
 # 3. Install baselines
 python -m pip install -q flash-linear-attention
@@ -297,6 +307,7 @@ Deltanet/
 │   ├── deltanet.cu               # Forward & backward pipeline coordinators
 │   └── deltanet_infer.cu         # Fast single-step (L = 1) inference kernel
 ├── deltanet_v2/
+│   ├── _C.cpython-310-*.so       # Pre-compiled CUDA SM75 extension (Python 3.10)
 │   ├── __init__.py               # Package exports
 │   ├── ops.py                    # Op dispatcher, fake tensor registrations, autograd
 │   └── model.py                  # Full DeltaBlock PyTorch module

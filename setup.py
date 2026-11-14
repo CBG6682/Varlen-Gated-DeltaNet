@@ -147,13 +147,13 @@ sources = [
     ]
 ]
 
-setup(
-    name="deltanet_v2",
-    version="2.0.0",
-    description="High-Performance DeltaNet v2 Linear Attention CUDA Kernels & PyTorch Module",
-    author="CBG6682",
-    packages=find_packages(),
-    ext_modules=[
+use_prebuilt = os.environ.get("USE_PREBUILT", "0") == "1"
+
+ext_modules = []
+cmdclass = {}
+
+if not use_prebuilt:
+    ext_modules = [
         CUDAExtension(
             name="deltanet_v2._C",
             sources=sources,
@@ -163,10 +163,20 @@ setup(
                 "nvcc": nvcc_flags,
             },
         ),
-    ],
-    cmdclass={
-        "build_ext": BuildExtension,
-    },
+    ]
+    cmdclass = {"build_ext": BuildExtension}
+else:
+    print("[setup.py] USE_PREBUILT=1 detected: Skipping CUDA compilation and using existing pre-compiled _C extension.")
+
+setup(
+    name="deltanet_v2",
+    version="2.0.0",
+    description="High-Performance DeltaNet v2 Linear Attention CUDA Kernels & PyTorch Module",
+    author="CBG6682",
+    packages=find_packages(),
+    package_data={"deltanet_v2": ["*.so"]},
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
     python_requires=">=3.8",
     install_requires=[
         "torch>=2.0.0",

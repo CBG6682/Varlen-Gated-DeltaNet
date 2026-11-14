@@ -239,29 +239,25 @@ The scripts measure both **latency (ms) / throughput (tokens/s)** and **peak VRA
 Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab or run directly in bash:
 
 ```bash
-# 1. Clone NVIDIA CUTLASS (provides <cute/tensor.hpp>)
-git clone --depth 1 https://github.com/NVIDIA/cutlass.git /content/cutlass
-export CUTLASS_PATH=/content/cutlass
-
-# 2. Clone repository to /content/Deltanet
-git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
+# 1. Clone repository with dedicated third_party/cutlass submodule to /content/Deltanet
+git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
 cd /content/Deltanet
 
-# 3. Install dependencies & DeltaNet v2
+# 2. Install dependencies & DeltaNet v2
 pip install ninja setuptools wheel einops
 pip install -e . --no-build-isolation
 
-# 4. Install baselines
+# 3. Install baselines
 pip install flash-linear-attention
 pip install git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps || true
 
-# 5. Benchmark Single-Step Autoregressive Inference (L = 1)
+# 4. Benchmark Single-Step Autoregressive Inference (L = 1)
 python /content/Deltanet/tests/bench_inference.py --dim 768 --batches 1,16,64,256,1024,2048
 
-# 6. Benchmark Training Pass (Forward + Backward)
+# 5. Benchmark Training Pass (Forward + Backward)
 python /content/Deltanet/tests/bench_training.py --dim 768 --batch-size 4 --seq-lens 512,1024,2048,4096
 
-# 7. Run All Benchmarks
+# 6. Run All Benchmarks
 python /content/Deltanet/tests/bench_all.py
 ```
 
@@ -294,6 +290,8 @@ Deltanet/
 │   ├── bench_training.py         # Forward + Backward training pass benchmark
 │   ├── bench_all.py              # Consolidated master benchmark runner
 │   └── test_correctness.py       # Numerical consistency verification vs PyTorch
+├── third_party/
+│   └── cutlass/                  # Dedicated NVIDIA CUTLASS / CuTe submodule (>= 3.0)
 ├── demo.ipynb                    # Colab / Kaggle runner notebook (/content)
 ├── setup.py                      # Build script with auto-CUTLASS discovery
 ├── pyproject.toml                # PEP 517/518 build specification

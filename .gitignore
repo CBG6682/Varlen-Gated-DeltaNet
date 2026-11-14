@@ -12,8 +12,8 @@ __pycache__/
 *$py.class
 .cache/
 
-# CUTLASS auto-clone
-cutlass/
+# Root CUTLASS auto-clone fallback
+/cutlass/
 
 # Local benchmark and NCU profiles (do not publish)
 Prompt/

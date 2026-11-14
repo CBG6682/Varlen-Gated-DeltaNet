@@ -10,7 +10,35 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def get_cutlass_include():
     """Locate or automatically clone NVIDIA CUTLASS repository."""
-    # 1. User-specified CUTLASS path via environment variable
+    # 1. Dedicated project-level third_party/cutlass (submodule or vendor directory)
+    third_party_cutlass = os.path.join(THIS_DIR, "third_party", "cutlass")
+    for cand in [
+        os.path.join(third_party_cutlass, "include"),
+        third_party_cutlass,
+        os.path.join(THIS_DIR, "thirdparty", "cutlass", "include"),
+        os.path.join(THIS_DIR, "thirdparty", "cutlass"),
+    ]:
+        if os.path.isfile(os.path.join(cand, "cute", "tensor.hpp")):
+            print(f"[setup.py] Found dedicated CUTLASS in third_party: {cand}")
+            return os.path.abspath(cand)
+
+    # Auto-initialize git submodule third_party/cutlass if present but unpopulated
+    if os.path.isfile(os.path.join(THIS_DIR, ".gitmodules")):
+        try:
+            print("[setup.py] Initializing dedicated third_party/cutlass submodule...")
+            subprocess.run(
+                ["git", "submodule", "update", "--init", "--depth", "1", "third_party/cutlass"],
+                cwd=THIS_DIR,
+                check=False,
+            )
+            cand = os.path.join(third_party_cutlass, "include")
+            if os.path.isfile(os.path.join(cand, "cute", "tensor.hpp")):
+                print(f"[setup.py] Submodule initialized successfully: {cand}")
+                return os.path.abspath(cand)
+        except Exception as e:
+            print(f"[setup.py] Notice: Submodule update skipped ({e})")
+
+    # 2. User-specified CUTLASS path via environment variable
     env_path = os.environ.get("CUTLASS_PATH")
     if env_path:
         for cand in [os.path.join(env_path, "include"), env_path]:
@@ -18,8 +46,9 @@ def get_cutlass_include():
                 print(f"[setup.py] Found CUTLASS from CUTLASS_PATH: {cand}")
                 return os.path.abspath(cand)
 
-    # 2. Google Colab standard locations (/content/cutlass)
+    # 3. Google Colab standard locations
     for colab_cand in [
+        "/content/Deltanet/third_party/cutlass/include",
         "/content/cutlass/include",
         "/content/cutlass",
         "/content/Deltanet/cutlass/include",
@@ -28,7 +57,7 @@ def get_cutlass_include():
             print(f"[setup.py] Found CUTLASS in Colab path: {colab_cand}")
             return os.path.abspath(colab_cand)
 
-    # 3. Local cutlass/ directory inside package
+    # 4. Local cutlass/ directory inside package
     local_cands = [
         os.path.join(THIS_DIR, "cutlass", "include"),
         os.path.join(THIS_DIR, "cutlass"),
@@ -39,15 +68,9 @@ def get_cutlass_include():
             print(f"[setup.py] Found CUTLASS in local directory: {cand}")
             return os.path.abspath(cand)
 
-    # 4. Relative path inside parent development workspace
-    parent_cand = os.path.abspath(os.path.join(THIS_DIR, "../../../../cutlass/include"))
-    if os.path.isfile(os.path.join(parent_cand, "cute", "tensor.hpp")):
-        print(f"[setup.py] Found CUTLASS in parent workspace: {parent_cand}")
-        return parent_cand
-
-    # 5. Automatically shallow-clone CUTLASS if absent
-    target_dir = "/content/cutlass" if os.path.isdir("/content") else os.path.join(THIS_DIR, "cutlass")
-    print(f"[setup.py] CUTLASS (<cute/tensor.hpp>) not found. Shallow cloning NVIDIA CUTLASS to {target_dir}...")
+    # 5. Automatically shallow-clone CUTLASS directly into dedicated third_party/cutlass
+    target_dir = os.path.join(THIS_DIR, "third_party", "cutlass")
+    print(f"[setup.py] CUTLASS (<cute/tensor.hpp>) not found. Shallow cloning to dedicated {target_dir}...")
     try:
         subprocess.run(
             ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", target_dir],

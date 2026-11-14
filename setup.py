@@ -113,12 +113,33 @@ def get_cuda_arch_flags():
 
 
 def get_existing_prebuilt():
-    """Find pre-compiled CUDA extension binary if present in deltanet_v2/."""
+    """Find pre-compiled CUDA extension binary if present in deltanet_v2/ or extract from wheels/."""
     pkg_dir = os.path.join(THIS_DIR, "deltanet_v2")
     if os.path.isdir(pkg_dir):
         for f in os.listdir(pkg_dir):
             if f.startswith("_C") and f.endswith(".so"):
                 return os.path.join(pkg_dir, f)
+
+    # Check wheels/ or root directory for prebuilt wheel containing .so
+    import glob
+    import zipfile
+    wheel_candidates = (
+        glob.glob(os.path.join(THIS_DIR, "wheels", "*.whl"))
+        + glob.glob(os.path.join(THIS_DIR, "*.whl"))
+        + glob.glob(os.path.join(THIS_DIR, "dist", "*.whl"))
+    )
+    for whl in wheel_candidates:
+        try:
+            with zipfile.ZipFile(whl, "r") as z:
+                for member in z.namelist():
+                    if member.startswith("deltanet_v2/_C") and member.endswith(".so"):
+                        print(f"[setup.py] Unpacking pre-compiled extension {member} from {whl}...")
+                        z.extract(member, THIS_DIR)
+                        extracted = os.path.join(THIS_DIR, member)
+                        if os.path.isfile(extracted):
+                            return extracted
+        except Exception as e:
+            print(f"[setup.py] Notice: Could not read wheel {whl} ({e})")
     return None
 
 

@@ -6,6 +6,11 @@ dist/
 *.o
 *.a
 
+# Track pre-compiled binary extension and wheel distributions
+!deltanet_v2/_C*.so
+!wheels/
+!wheels/*.whl
+
 # Bytecode and cache
 __pycache__/
 *.py[cod]

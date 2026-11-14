@@ -4,11 +4,17 @@ Provides precise CUDA event timing, peak VRAM memory tracking, and dynamic basel
 """
 
 import gc
+import os
 import sys
+import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 
 def get_device() -> torch.device:
@@ -143,18 +149,48 @@ def measure_performance(
 # Dynamic Baseline Model Loaders
 # =========================================================================
 
+def try_import_nvlabs_gdn2():
+    """
+    Attempt to import GatedDeltaNet2 from official NVIDIA NVlabs repository.
+    Searches installed lit_gpt package as well as clone locations.
+    """
+    try:
+        from lit_gpt.gdn2 import GatedDeltaNet2
+        return GatedDeltaNet2
+    except ImportError:
+        pass
+
+    candidates = [
+        "/content/gateddeltanet-2",
+        "/content/GatedDeltaNet-2",
+        "/tmp/gateddeltanet-2",
+        "/tmp/GatedDeltaNet-2",
+        os.path.join(ROOT_DIR, "gateddeltanet-2"),
+        os.path.join(ROOT_DIR, "..", "gateddeltanet-2"),
+    ]
+    for cand in candidates:
+        if os.path.isdir(cand) and cand not in sys.path:
+            sys.path.insert(0, cand)
+            try:
+                from lit_gpt.gdn2 import GatedDeltaNet2
+                return GatedDeltaNet2
+            except ImportError:
+                pass
+    return None
+
+
 def try_import_fla_gdn2():
     """
-    Attempt to import GatedDeltaNet2 (official NVIDIA GDN2 architecture in FLA).
+    Attempt to import GatedDeltaNet2 from Flash Linear Attention (FLA) library.
     Returns class or None.
     """
     try:
-        from fla.layers import GatedDeltaNet2
+        from fla.layers.gdn2 import GatedDeltaNet2
         return GatedDeltaNet2
     except ImportError:
         pass
     try:
-        from fla.layers.gdn2 import GatedDeltaNet2
+        from fla.layers import GatedDeltaNet2
         return GatedDeltaNet2
     except ImportError:
         pass
@@ -163,16 +199,16 @@ def try_import_fla_gdn2():
 
 def try_import_fla_gdn():
     """
-    Attempt to import GatedDeltaNet (v1 architecture in FLA).
+    Attempt to import GatedDeltaNet (v1 architecture) from Flash Linear Attention.
     Returns class or None.
     """
     try:
-        from fla.layers import GatedDeltaNet
+        from fla.layers.gated_deltanet import GatedDeltaNet
         return GatedDeltaNet
     except ImportError:
         pass
     try:
-        from fla.layers.gated_deltanet import GatedDeltaNet
+        from fla.layers import GatedDeltaNet
         return GatedDeltaNet
     except ImportError:
         pass
@@ -181,6 +217,11 @@ def try_import_fla_gdn():
 
 def try_import_fla_cache():
     """Attempt to import Cache object from FLA for stateful autoregressive generation."""
+    try:
+        from fla.models.cache_utils import Cache
+        return Cache
+    except ImportError:
+        pass
     try:
         from fla.models.utils import Cache
         return Cache
@@ -192,6 +233,7 @@ def try_import_fla_cache():
 def check_baseline_availability() -> Dict[str, bool]:
     """Check availability of external baseline packages."""
     return {
+        "nvlabs_gdn2": try_import_nvlabs_gdn2() is not None,
         "fla_gdn2": try_import_fla_gdn2() is not None,
         "fla_gdn": try_import_fla_gdn() is not None,
         "fla_cache": try_import_fla_cache() is not None,
@@ -204,16 +246,17 @@ def print_baseline_status() -> None:
     print("\n" + "=" * 72)
     print("BASELINE AVAILABILITY")
     print("=" * 72)
-    print(f"[-] DeltaNet v2 (Ours - SM75 CuTe)   : INSTALLED")
-    print(f"[-] DeltaNet v2 (PyTorch Reference)  : INSTALLED")
-    print(f"[-] FLA GatedDeltaNet-2 (NVLabs)     : {'INSTALLED' if avail['fla_gdn2'] else 'NOT FOUND'}")
-    print(f"[-] FLA GatedDeltaNet (v1)           : {'INSTALLED' if avail['fla_gdn'] else 'NOT FOUND'}")
+    print(f"[-] DeltaNet v2 (Ours - SM75 CuTe)     : INSTALLED")
+    print(f"[-] DeltaNet v2 (PyTorch Reference)    : INSTALLED")
+    print(f"[-] NVLabs GatedDeltaNet-2 (Official)  : {'INSTALLED' if avail['nvlabs_gdn2'] else 'NOT FOUND'}")
+    print(f"[-] FLA GatedDeltaNet-2 (FLA Library)  : {'INSTALLED' if avail['fla_gdn2'] else 'NOT FOUND'}")
+    print(f"[-] FLA GatedDeltaNet (v1)             : {'INSTALLED' if avail['fla_gdn'] else 'NOT FOUND'}")
 
-    if not (avail['fla_gdn2'] or avail['fla_gdn']):
-        print("\n[!] Notice: Baselines from Flash Linear Attention are not installed.")
-        print("    To benchmark against NVLabs GatedDeltaNet-2 and FLA, run:")
-        print("      pip install flash-linear-attention")
-        print("      pip install git+https://github.com/nvlabs/gateddeltanet-2.git --no-deps")
+    if not (avail['nvlabs_gdn2'] and avail['fla_gdn2']):
+        print("\n[!] Notice: External baselines can be installed via:")
+        print("    rm -rf /content/gateddeltanet-2")
+        print("    git clone --depth 1 https://github.com/NVlabs/GatedDeltaNet-2.git /content/gateddeltanet-2")
+        print("    pip install git+https://github.com/sustcsonglin/flash-linear-attention.git --no-build-isolation")
     print("=" * 72 + "\n")
 
 

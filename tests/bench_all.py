@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--train-seq-lens", type=str, default="512,1024,2048,4096", help="Training sequence lengths")
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=30, help="Number of timed iterations")
+    parser.add_argument("--use-conv", action="store_true", help="Enable ShortConvolution in baselines (default: False)")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 instead of float16")
     args = parser.parse_args()
 
@@ -53,6 +54,7 @@ def main():
         batch_sizes=infer_batches,
         num_warmup=args.warmup,
         num_iters=args.iters,
+        use_short_conv=args.use_conv,
         dtype=dtype,
     )
 
@@ -68,6 +70,7 @@ def main():
         seq_lens=train_seq_lens,
         num_warmup=args.warmup,
         num_iters=args.iters,
+        use_short_conv=args.use_conv,
         dtype=dtype,
     )
 

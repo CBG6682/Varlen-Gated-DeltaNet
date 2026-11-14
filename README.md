@@ -144,7 +144,14 @@ Before building and compiling the extension, ensure your system provides:
 
 ### 1. Installation
 
-#### Standard Installation from Source:
+#### Option A: Instant Install from Prebuilt Wheel (Recommended for Google Colab / Linux x86_64):
+```bash
+git clone https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
+cd Varlen-Gated-DeltaNet
+pip install wheels/*.whl
+```
+
+#### Option B: Standard Installation from Source:
 ```bash
 git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
 cd Varlen-Gated-DeltaNet
@@ -152,8 +159,8 @@ pip install ninja setuptools wheel einops
 MAX_JOBS=2 pip install . --no-build-isolation
 ```
 > **Build Options**:
-> - **Default**: If no pre-compiled binary is found in `deltanet_v2/`, `setup.py` automatically compiles CUDA kernels from source. If an existing `.so` is present, it will be reused immediately.
-> - **Force Rebuild**: Set `FORCE_REBUILD=1` (e.g. `FORCE_REBUILD=1 pip install . --no-build-isolation`) if you modified C++/CUDA code in `src/` or `include/` and want to overwrite.
+> - **Prebuilt Reuse**: If `wheels/*.whl` or `deltanet_v2/_C*.so` is present, `setup.py` automatically reuses the precompiled binary for instant setup.
+> - **Force Rebuild**: Set `FORCE_REBUILD=1` (e.g. `FORCE_REBUILD=1 pip install . --no-build-isolation`) if you modified C++/CUDA code in `src/` or `include/` and want to recompile.
 
 ---
 
@@ -292,6 +299,7 @@ Deltanet/
 │   └── test_correctness.py       # Numerical consistency verification vs PyTorch
 ├── third_party/
 │   └── cutlass/                  # Dedicated NVIDIA CUTLASS / CuTe submodule (>= 3.0)
+├── wheels/                       # Pre-compiled standalone .whl distributions
 ├── demo.ipynb                    # Colab / Kaggle runner notebook (/content)
 ├── setup.py                      # Build script with auto-CUTLASS discovery
 ├── pyproject.toml                # PEP 517/518 build specification

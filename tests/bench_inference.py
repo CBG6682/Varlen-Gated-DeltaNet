@@ -1,7 +1,10 @@
 """
 Benchmark: Single-Step Autoregressive Inference (L = 1)
 Evaluates decoding latency (ms/step), generation throughput (tokens/sec), and peak VRAM.
-Compares DeltaNet v2 (SM75 CuTe fused kernel) against FLA GatedDeltaNet-2, FLA GatedDeltaNet, and PyTorch reference.
+Compares DeltaNet v2 (SM75 CuTe fused kernel) against NVLabs GatedDeltaNet-2, FLA GatedDeltaNet-2, FLA GatedDeltaNet (v1), and PyTorch reference.
+
+Benchmarks strictly the Gated DeltaNet token-mixer block (without MLP / FFW / SWA)
+to ensure direct and fair comparison of the recurrence kernels.
 """
 
 import argparse
@@ -29,6 +32,7 @@ from tests.utils import (
     try_import_fla_cache,
     try_import_fla_gdn,
     try_import_fla_gdn2,
+    try_import_nvlabs_gdn2,
 )
 
 
@@ -41,6 +45,7 @@ def run_inference_benchmark(
     batch_sizes: Optional[List[int]] = None,
     num_warmup: int = 15,
     num_iters: int = 50,
+    use_short_conv: bool = False,
     dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
 ) -> List[Dict[str, Any]]:
@@ -54,10 +59,10 @@ def run_inference_benchmark(
 
     print_section("BENCHMARK: SINGLE-STEP AUTOREGRESSIVE INFERENCE (L = 1)")
     print(f"Config: d_model={d_model}, num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}, "
-          f"d_k={d_k}, d_v={d_v}, dtype={dtype}, device={device}")
+          f"d_k={d_k}, d_v={d_v}, use_short_conv={use_short_conv}, dtype={dtype}, device={device}")
     print(f"Batch sizes to evaluate: {batch_sizes}\n")
 
-    # 1. DeltaNet v2 Block
+    # 1. DeltaNet v2 Block (Pure Gated DeltaNet: hidden_dim=None excludes FFW/MLP)
     print("Initializing DeltaNet v2...")
     our_block = DeltaBlock(
         d_model=d_model,
@@ -65,40 +70,79 @@ def run_inference_benchmark(
         num_kv_heads=num_kv_heads,
         d_k=d_k,
         d_v=d_v,
+        hidden_dim=None,
     ).to(device=device, dtype=dtype)
     our_block.eval()
 
-    # 2. Check and load FLA Baselines
+    # 2. Check and load Baselines
+    nvlabs_gdn2_cls = try_import_nvlabs_gdn2()
     fla_gdn2_cls = try_import_fla_gdn2()
     fla_gdn_cls = try_import_fla_gdn()
     fla_cache_cls = try_import_fla_cache()
 
+    # NVLabs GatedDeltaNet-2 (Official NVIDIA implementation)
+    nvlabs_gdn2_block = None
+    if nvlabs_gdn2_cls is not None:
+        try:
+            print("Initializing NVLabs GatedDeltaNet-2 (Official NVIDIA reference)...")
+            nvlabs_gdn2_block = nvlabs_gdn2_cls(
+                hidden_size=d_model,
+                num_heads=num_kv_heads,
+                head_dim=d_k,
+                expand_v=float(d_v) / float(d_k),
+                mode="fused_recurrent",
+                use_short_conv=use_short_conv,
+                layer_idx=0,
+            ).to(device=device, dtype=dtype)
+            nvlabs_gdn2_block.eval()
+        except Exception as e:
+            print(f"[!] Warning: Could not instantiate NVLabs GatedDeltaNet-2 with mode='fused_recurrent' ({e}). Retrying default.")
+            try:
+                nvlabs_gdn2_block = nvlabs_gdn2_cls(
+                    hidden_size=d_model,
+                    num_heads=num_kv_heads,
+                    head_dim=d_k,
+                    expand_v=float(d_v) / float(d_k),
+                    use_short_conv=use_short_conv,
+                    layer_idx=0,
+                ).to(device=device, dtype=dtype)
+                nvlabs_gdn2_block.eval()
+            except Exception as e2:
+                print(f"[!] Error instantiating NVLabs GatedDeltaNet-2: {e2}")
+                nvlabs_gdn2_block = None
+
+    # FLA GatedDeltaNet-2 (Flash Linear Attention library)
     fla_gdn2_block = None
     if fla_gdn2_cls is not None:
         try:
-            print("Initializing FLA GatedDeltaNet-2 (NVLabs architecture)...")
+            print("Initializing FLA GatedDeltaNet-2 (Flash Linear Attention)...")
             fla_gdn2_block = fla_gdn2_cls(
                 hidden_size=d_model,
                 num_heads=num_kv_heads,
                 head_dim=d_k,
                 expand_v=float(d_v) / float(d_k),
                 mode="fused_recurrent",
+                use_short_conv=use_short_conv,
+                layer_idx=0,
             ).to(device=device, dtype=dtype)
             fla_gdn2_block.eval()
         except Exception as e:
-            print(f"[!] Warning: Could not instantiate FLA GatedDeltaNet-2 with mode='fused_recurrent' ({e}). Falling back to default mode.")
+            print(f"[!] Warning: Could not instantiate FLA GatedDeltaNet-2 with mode='fused_recurrent' ({e}). Retrying default.")
             try:
                 fla_gdn2_block = fla_gdn2_cls(
                     hidden_size=d_model,
                     num_heads=num_kv_heads,
                     head_dim=d_k,
                     expand_v=float(d_v) / float(d_k),
+                    use_short_conv=use_short_conv,
+                    layer_idx=0,
                 ).to(device=device, dtype=dtype)
                 fla_gdn2_block.eval()
             except Exception as e2:
                 print(f"[!] Error instantiating FLA GatedDeltaNet-2: {e2}")
                 fla_gdn2_block = None
 
+    # FLA GatedDeltaNet (v1)
     fla_gdn_block = None
     if fla_gdn_cls is not None:
         try:
@@ -109,6 +153,8 @@ def run_inference_benchmark(
                 head_dim=d_k,
                 expand_v=float(d_v) / float(d_k),
                 mode="fused_recurrent",
+                use_short_conv=use_short_conv,
+                layer_idx=0,
             ).to(device=device, dtype=dtype)
             fla_gdn_block.eval()
         except Exception as e:
@@ -118,10 +164,12 @@ def run_inference_benchmark(
                     num_heads=num_kv_heads,
                     head_dim=d_k,
                     expand_v=float(d_v) / float(d_k),
+                    use_short_conv=use_short_conv,
+                    layer_idx=0,
                 ).to(device=device, dtype=dtype)
                 fla_gdn_block.eval()
             except Exception as e2:
-                print(f"[!] Error instantiating FLA GatedDeltaNet: {e2}")
+                print(f"[!] Error instantiating FLA GatedDeltaNet (v1): {e2}")
                 fla_gdn_block = None
 
     all_results = []
@@ -161,7 +209,8 @@ def run_inference_benchmark(
                 "1.00x",
             ])
         else:
-            rows.append([B, "PyTorch Reference (Unfused)", "OOM", "-", "-", "-"])
+            print(f"  [!] PyTorch Reference failed at B={B}: {res_ref.get('error_msg')}")
+            rows.append([B, "PyTorch Reference (Unfused)", res_ref["status"], "-", "-", "-"])
 
         # Baseline B: FLA GatedDeltaNet (v1)
         if fla_gdn_block is not None:
@@ -175,7 +224,7 @@ def run_inference_benchmark(
             if res_fla_gdn["status"] == "OK":
                 lat = res_fla_gdn["latency_ms"]
                 tok_s = (B * 1000.0) / lat
-                sp = f"{ref_lat / lat:.2f}x" if not torch.isnan(torch.tensor(ref_lat)) else "-"
+                sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
                 rows.append([
                     B,
                     "FLA GatedDeltaNet (v1)",
@@ -185,31 +234,58 @@ def run_inference_benchmark(
                     sp,
                 ])
             else:
+                print(f"  [!] FLA GatedDeltaNet (v1) notice at B={B}: {res_fla_gdn.get('error_msg')}")
                 rows.append([B, "FLA GatedDeltaNet (v1)", res_fla_gdn["status"], "-", "-", "-"])
 
-        # Baseline C: FLA GatedDeltaNet-2 (NVLabs)
+        # Baseline C: FLA GatedDeltaNet-2
         if fla_gdn2_block is not None:
-            cache_gdn2 = fla_cache_cls() if fla_cache_cls is not None else None
+            cache_fla_gdn2 = fla_cache_cls() if fla_cache_cls is not None else None
 
             def run_fla_gdn2():
                 with torch.no_grad():
-                    return fla_gdn2_block(x_step, past_key_values=cache_gdn2, use_cache=True)
+                    return fla_gdn2_block(x_step, past_key_values=cache_fla_gdn2, use_cache=True)
 
             res_fla_gdn2 = measure_performance(run_fla_gdn2, num_warmup, num_iters, device)
             if res_fla_gdn2["status"] == "OK":
                 lat = res_fla_gdn2["latency_ms"]
                 tok_s = (B * 1000.0) / lat
-                sp = f"{ref_lat / lat:.2f}x" if not torch.isnan(torch.tensor(ref_lat)) else "-"
+                sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
                 rows.append([
                     B,
-                    "FLA GatedDeltaNet-2 (NVLabs)",
+                    "FLA GatedDeltaNet-2",
                     f"{lat:.3f}",
                     f"{tok_s:,.0f}",
                     f"{res_fla_gdn2['peak_alloc_mb']:.1f}",
                     sp,
                 ])
             else:
-                rows.append([B, "FLA GatedDeltaNet-2 (NVLabs)", res_fla_gdn2["status"], "-", "-", "-"])
+                print(f"  [!] FLA GatedDeltaNet-2 notice at B={B}: {res_fla_gdn2.get('error_msg')}")
+                rows.append([B, "FLA GatedDeltaNet-2", res_fla_gdn2["status"], "-", "-", "-"])
+
+        # Baseline D: NVLabs GatedDeltaNet-2 (Official NVIDIA)
+        if nvlabs_gdn2_block is not None:
+            cache_nvlabs_gdn2 = fla_cache_cls() if fla_cache_cls is not None else None
+
+            def run_nvlabs_gdn2():
+                with torch.no_grad():
+                    return nvlabs_gdn2_block(x_step, past_key_values=cache_nvlabs_gdn2, use_cache=True)
+
+            res_nvlabs_gdn2 = measure_performance(run_nvlabs_gdn2, num_warmup, num_iters, device)
+            if res_nvlabs_gdn2["status"] == "OK":
+                lat = res_nvlabs_gdn2["latency_ms"]
+                tok_s = (B * 1000.0) / lat
+                sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
+                rows.append([
+                    B,
+                    "NVLabs GatedDeltaNet-2",
+                    f"{lat:.3f}",
+                    f"{tok_s:,.0f}",
+                    f"{res_nvlabs_gdn2['peak_alloc_mb']:.1f}",
+                    sp,
+                ])
+            else:
+                print(f"  [!] NVLabs GatedDeltaNet-2 notice at B={B}: {res_nvlabs_gdn2.get('error_msg')}")
+                rows.append([B, "NVLabs GatedDeltaNet-2", res_nvlabs_gdn2["status"], "-", "-", "-"])
 
         # Method: DeltaNet v2 (Ours - SM75 Fused CUDA Kernel)
         def run_ours():
@@ -220,7 +296,7 @@ def run_inference_benchmark(
         if res_ours["status"] == "OK":
             lat = res_ours["latency_ms"]
             tok_s = (B * 1000.0) / lat
-            sp = f"{ref_lat / lat:.2f}x" if not torch.isnan(torch.tensor(ref_lat)) else "-"
+            sp = f"{ref_lat / lat:.2f}x" if (ref_lat > 0 and lat > 0) else "-"
             rows.append([
                 B,
                 "**DeltaNet v2 (Ours - SM75 CuTe)**",
@@ -230,6 +306,7 @@ def run_inference_benchmark(
                 f"**{sp}**",
             ])
         else:
+            print(f"  [!] DeltaNet v2 (Ours) failed at B={B}: {res_ours.get('error_msg')}")
             rows.append([B, "**DeltaNet v2 (Ours - SM75 CuTe)**", res_ours["status"], "-", "-", "-"])
 
         all_results.append({
@@ -257,6 +334,7 @@ def parse_args():
     parser.add_argument("--batches", type=str, default="1,16,64,256,1024,2048", help="Comma-separated batch sizes")
     parser.add_argument("--warmup", type=int, default=15, help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=50, help="Number of timed iterations")
+    parser.add_argument("--use-conv", action="store_true", help="Enable ShortConvolution in baselines (default: False)")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 instead of float16")
     parser.add_argument("--save-md", type=str, default=None, help="Save markdown table to file")
     return parser.parse_args()
@@ -279,5 +357,6 @@ if __name__ == "__main__":
         batch_sizes=b_list,
         num_warmup=args.warmup,
         num_iters=args.iters,
+        use_short_conv=args.use_conv,
         dtype=dtype,
     )

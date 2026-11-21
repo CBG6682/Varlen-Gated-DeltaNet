@@ -404,7 +404,7 @@ def test_varlen_fwd_bwd_kernels(
             res_k = _run_raw("kernel")
 
             for name in res_t:
-                lead = 2 if name in ("y", "final_states") or name.startswith("grad_") else None
+                lead = 2 if name in ("y", "final_states") else None
                 use_ratio = not name.startswith("grad_")
                 _dual_check(
                     failures, tag, name, res_k[name], res_b[name], res_t[name],
@@ -435,7 +435,10 @@ def test_varlen_fwd_bwd_kernels(
     _record(
         failures, tag_direct, "forward_only == train fwd",
         torch.equal(y_fo, y_tr) and torch.equal(fs_fo, fs_tr)
-        and W_fo.numel() == 0 and S_fo.numel() == 0 and W_tr.numel() > 0 and S_tr.numel() > 0,
+        and (W_fo is None or W_fo.numel() == 0)
+        and (S_fo is None or S_fo.numel() == 0)
+        and W_tr is not None and S_tr is not None
+        and W_tr.numel() > 0 and S_tr.numel() > 0,
     )
 
     gy_d = torch.randn_like(y_tr)

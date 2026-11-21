@@ -20,39 +20,7 @@
 
 using namespace cute;
 
-// =========================================================================================
-// SECTION 1: GLOBAL KERNEL (kernel_output_combine_fwd)
-// =========================================================================================
-// Execution Flow Summary (Shape<_4, _1, _1> & GQA Group Loop):
-// - Configuration:
-//   * Grid: (num_kv_heads, num_chunks) -> 1 Thread Block handles 1 GQA group (g = 0..num_groups-1),
-//     reusing K_scaled, V_new, and S in SMEM across all query heads (saving GMEM bandwidth by 1/G).
-//   * Block: 128 threads (4 warps along M dimension, TiledMMA Shape<_4, _1, _1>).
-//   * A single pair of fragments (tCrA, tCrB) is reused across GEMMs to minimize register pressure.
-// - Stages 1 & 2 - Prologue:
-//   * Temporarily borrow smem_4 to compute 2-warp prefix scan for log_alpha_cumsum.
-//   * Cache row coordinates (r_c_row_a, r_c_row_b, r_a_t_a, r_a_t_b) and 16 column coords r_c_col[16]
-//     in registers to eliminate register spilling; synchronize and release smem_4.
-//   * Load K_raw, gamma -> recompute K_scaled, write to SMEM Region 2 (smem_2) via Swizzle.
-//   * Load V_raw, W_gate, gamma -> recompute V_new, write to SMEM Region 3 (smem_3) via Swizzle.
-//   * Load S from GMEM, write to SMEM Region 4 (smem_4) via Swizzle.
-//   * Load Q for group 0 (g = 0) from GMEM, write to SMEM Region 1 (smem_1) via Swizzle.
-//   * [SYNC 0] ensure all 4 SMEM regions are ready.
-// - Stage 3 - Loop over query heads: for (int64_t g = 0; g < num_groups; ++g):
-//   * Step 3.1 - GEMM 1: Q_S = Q @ S^T (LDSM_N reads Q from Region 1, LDSM_N reads S from Region 4).
-//     - In-place register epilogue: O_inter = (Q @ S^T) * a_t (FP32). Retain tCrA holding Q.
-//   * Step 3.2 - GEMM 2: R = Q @ K_scaled^T (LDSM_N reads K_scaled from Region 2, tCrA retains Q).
-//     - Prefetch Q_next (if g + 1 < num_groups) from GMEM into register buffer r_q_next.
-//     - In-place register epilogue: A_ij = R_ij * E_ij, cast to FP16 and overwrite into tCrA.
-//   * Step 3.3 - GEMM 3: O_total = A @ V_new + O_inter (LDSM_T reads V_new from Region 3).
-//     - Accumulate A @ V_new directly into tCrC_O (holding O_inter).
-//     - Staging tCrC_O to SMEM Region 1.
-//   * Step 3.4 - Write O_total from SMEM Region 1 to GMEM (uint4) & update Region 1 with Q_next:
-//     - [SYNC 1] ensure all warps have read Q from Region 1.
-//     - Store O_total to GMEM gOut.
-//     - If g + 1 < num_groups, write r_q_next into Region 1 (smem_1) via Swizzle.
-//     - [SYNC 2] ensure Q_next is ready for next iteration.
-// =========================================================================================
+// Output combine forward kernel fusing inter-chunk and intra-chunk attention.
 template <
     typename T,
     int NUM_THREADS,
@@ -84,9 +52,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
     int64_t num_chunks,                         // scalar [int64]
     int64_t total_L                             // scalar [int64]
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Thread and Block indexing (Grid: num_kv_heads, num_chunks)
-    // -------------------------------------------------------------------------------------
     int h_kv       = blockIdx.x;
     int curr_chunk = blockIdx.y;
     int tid        = threadIdx.x;
@@ -197,10 +163,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
     // Register prefetch buffer for Q_next
     decltype(make_fragment_like(dummy_part)) r_q_next[NUM_STPS];
 
-    // -------------------------------------------------------------------------------------
     // Stage 1.1 - 2-Warp Prefix Scan computing intra-chunk log_alpha_cumsum
     // Borrow smem_4 as warp exchange buffer, then release
-    // -------------------------------------------------------------------------------------
     float* s_temp_log_alpha = reinterpret_cast<float*>(smem.smem_4);
     float* s_temp_warp0_sum = reinterpret_cast<float*>(smem.smem_4) + CHUNK_SIZE;
 
@@ -245,9 +209,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
     }
     __syncthreads(); // Release smem_4 completely
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Prologue: Load K_scaled (Region 2), V_new (Region 3), S (Region 4), Q_0 (Region 1)
-    // -------------------------------------------------------------------------------------
     int64_t k_offset_curr  = kv_head_offset * D_K + (int64_t)chunk_start * D_K;
     int64_t v_offset_curr  = kv_head_offset * D_V + (int64_t)chunk_start * D_V;
     const T* p_gamma_chunk = gGamma + kv_head_offset;
@@ -372,17 +334,13 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
     }
     __syncthreads(); // [SYNC 0] (RAW: Q in Region 1, K in Region 2, V in Region 3, S in Region 4)
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Sequential loop over Query heads in GQA group (g = 0..num_groups - 1)
-    // -------------------------------------------------------------------------------------
     for (int64_t g = 0; g < num_groups; ++g) {
         int64_t curr_h_q      = (int64_t)h_kv * num_groups + g;
         int64_t q_head_offset = curr_h_q * total_L;
         int64_t out_base      = (q_head_offset + (int64_t)chunk_start) * D_V;
 
-        // ---------------------------------------------------------------------------------
         // Step 3.1 - GEMM 1: Q_S = Q @ S^T & Compute O_inter
-        // ---------------------------------------------------------------------------------
         cute::copy(s2r_copy_a_km, tCsA_Q, tCrA_view);
         cute::copy(s2r_copy_b_km, tCsB_S, tCrB_km_view);
 
@@ -399,9 +357,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
         }
         // Retain tCrA containing Q directly for GEMM 2 without SMEM reload
 
-        // ---------------------------------------------------------------------------------
         // Step 3.2 - GEMM 2: R = Q @ K_scaled^T & Epilogue into tCrA
-        // ---------------------------------------------------------------------------------
         cute::copy(s2r_copy_b_km, tCsB_K, tCrB_km_view);
 
         clear(tCrC_R);
@@ -438,9 +394,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
             tCrA(4 * n + 3) = float_to_out<T>(tCrC_R(4 * n + 3) * e_b1);
         }
 
-        // ---------------------------------------------------------------------------------
         // Step 3.3 - GEMM 3: O_total = A @ V_new + O_inter & Staging to Region 1
-        // ---------------------------------------------------------------------------------
         cute::copy(s2r_copy_b_mn, tCsB_V, tCrB_mn_view);
 
         // Accumulate A @ V_new directly into tCrC_O (which already holds O_inter)
@@ -463,9 +417,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
         // [SYNC 2] (RAW: ensure O_total has been fully written to Region 1)
         __syncthreads();
 
-        // ---------------------------------------------------------------------------------
         // Step 3.4 - Store O_total from Region 1 to GMEM (uint4) & update Region 1 with Q_next
-        // ---------------------------------------------------------------------------------
         #pragma unroll
         for (int st = 0; st < NUM_STPS; ++st) {
             int local_row = st * ROWS_PER_STP + row_in_step;
@@ -490,9 +442,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_fwd(
     }
 }
 
-// =========================================================================================
-// SECTION 2: HOST FUNCTION (output_combine_fwd)
-// =========================================================================================
+// Host wrapper for output_combine_fwd. Output: out (H_q, total_L, d_v).
 at::Tensor
 output_combine_fwd(
     const at::Tensor& q,                // (num_q_heads, total_L, d_k) [FP16] - Raw Query
@@ -510,9 +460,7 @@ output_combine_fwd(
     int64_t d_v,                        // scalar [int64] - Head dimension Value (default: 64)
     int64_t chunk_size                  // scalar [int64] - Chunk size (default: 64)
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     at::cuda::CUDAGuard device_guard(q.device());
 
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && b.is_cuda() && w.is_cuda(), "Inputs must be CUDA tensors");
@@ -538,9 +486,7 @@ output_combine_fwd(
     int64_t total_L    = q.size(1);
     int64_t num_groups = num_q_heads / num_kv_heads;
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Kernel Launch Configuration
-    // -------------------------------------------------------------------------------------
     auto [chunk_offsets_gpu, chunk_valid_lens_gpu, num_chunks] = compute_chunk_offsets_and_valid_lens(cu_seq_lens, chunk_size);
 
     at::Tensor out = torch::empty({num_q_heads, total_L, d_v}, q.options());
@@ -608,8 +554,6 @@ output_combine_fwd(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Return Output
-    // -------------------------------------------------------------------------------------
     return out;
 }

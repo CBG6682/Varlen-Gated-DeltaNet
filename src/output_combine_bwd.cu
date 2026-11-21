@@ -21,38 +21,9 @@
 
 using namespace cute;
 
-// =========================================================================================
-// SECTION 1: GLOBAL KERNELS (BWD OUTPUT COMBINE 3-KERNEL ARCHITECTURE)
-// =========================================================================================
+// GLOBAL KERNELS (BWD OUTPUT COMBINE 3-KERNEL ARCHITECTURE)
 
-// -----------------------------------------------------------------------------------------
-// Kernel 2: kernel_output_combine_dc_inter_dS
-// -----------------------------------------------------------------------------------------
-// Execution Flow Summary:
-// - Grid: (num_kv_heads, num_chunks), Block: 128 threads (4 warps with TiledMMA Shape<_2, _2, _1>).
-// - Responsibilities:
-//   1. Compute dq_total = G @ S + dq_intra (reads dq_intra from SMEM Region 3 via partition_C, gemm,
-//      stages back to Region 3 and writes to GMEM gdQ).
-//   2. Accumulate dS += G^T @ Q across the loop over query heads g into tCrC_dS.
-//   3. Compute Q_S = Q @ S^T and epilogue dc_inter += rowsum_v(G * Q_S) on registers.
-// - Shared memory allocation (4 regions, 8 KB each, total 32 KB):
-//   * Region 1 (smem_1): S, stationary throughout the kernel.
-//   * Region 2 (smem_2): G = dO * a_t; later used for dc_inter reduction and staging dS in epilogue.
-//   * Region 3 (smem_3): dq_intra, later stages dq_total to GMEM (uint4).
-//   * Region 4 (smem_4): Prefix scan workspace in prologue, then holds Q.
-// - 3 GEMMs in query loop g:
-//   * GEMM 1: dq_total = G @ S + dq_intra (G in Region 2 LDSM_N, S in Region 1 LDSM_T, dq_intra from Region 3 -> tCrC_dq).
-//     [SYNC 1] (WAR: dq_intra read complete) -> write dq_total back to Region 3 (sDq_flat with Swizzle).
-//   * GEMM 2: dS += G^T @ Q (G^T in Region 2 LDSM_T, Q in Region 4 LDSM_T -> tCrC_dS).
-//     Prefetch Q_next, dO_next, dq_intra_next into r_q_next, r_dO_next, r_dq_next (if g + 1 < num_groups).
-//   * GEMM 3: Q_S = Q @ S^T (Q in Region 4 LDSM_N, S^T in Region 1 LDSM_N -> tCrC_QS).
-//     Epilogue dc_inter: Accumulate dc_inter_i += rowsum_v(G * Q_S) using view tCsC_G.
-//     [SYNC 2] (RAW: dq_total written to Region 3; WAR: G in Region 2 and Q in Region 4 read complete).
-//   * Step 3.3: Use TiledCopy uint4 to read dq_total from Region 3 and write 128-bit stores to GMEM gdQ.
-//     Overwrite r_dq_next into Region 3, G_next into Region 2, Q_next into Region 4 -> [SYNC 3] (RAW ready for g + 1).
-// - Stage 4 - Final Epilogue:
-//   * Use Region 2 (smem_2) for inter-warp reduction of dc_inter and write to gDcInter.
-//   * Stage tCrC_dS into Region 2 (smem_2) with Swizzle -> [SYNC] -> 128-bit vectorized stores (uint4) to gdS.
+// kernel_output_combine_dc_inter_dS
 template <
     typename T,
     int NUM_THREADS,
@@ -83,9 +54,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     int64_t num_chunks,                         // scalar [int64]
     int64_t total_L                             // scalar [int64]
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Thread & Block Indexing
-    // -------------------------------------------------------------------------------------
     int h_kv       = blockIdx.x;
     int curr_chunk = blockIdx.y;
     int tid        = threadIdx.x;
@@ -219,9 +188,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     decltype(make_fragment_like(dummy_part)) r_dO_next[NUM_STPS];
     decltype(make_fragment_like(dummy_part)) r_dq_next[NUM_STPS];
 
-    // -------------------------------------------------------------------------------------
     // Stage 1.1 - Prefix Scan for log_alpha_cumsum (temporarily borrows smem_4)
-    // -------------------------------------------------------------------------------------
     float* s_temp_log_alpha = reinterpret_cast<float*>(smem.smem_4);
     float* s_temp_warp0_sum = reinterpret_cast<float*>(smem.smem_4) + CHUNK_SIZE;
 
@@ -264,9 +231,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     float r_dc_inter_a[2] = {0.0f, 0.0f};
     float r_dc_inter_b[2] = {0.0f, 0.0f};
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Prologue: Load S into Region 1 and Group 0 into Regions 2 & 4
-    // -------------------------------------------------------------------------------------
     // 1. Load stationary S into Region 1 (smem_1)
     int64_t s_chunk_offset = ((int64_t)h_kv * num_chunks + curr_chunk) * ((int64_t)D_V * D_K);
     const T* p_s_chunk = gS + s_chunk_offset;
@@ -332,16 +297,12 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     }
     __syncthreads(); // [SYNC 0] (RAW: S in Region 1, G in Region 2, dq_intra in Region 3, Q in Region 4)
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Sequential Loop over Query Heads in GQA Group (g = 0..num_groups - 1)
-    // -------------------------------------------------------------------------------------
     for (int64_t g = 0; g < num_groups; ++g) {
         int64_t curr_h_q   = (int64_t)h_kv * num_groups + g;
         int64_t q_out_base = (curr_h_q * total_L + (int64_t)chunk_start) * D_K;
 
-        // ---------------------------------------------------------------------------------
         // Step 3.1 - GEMM 1: dq_total = G @ S + dq_intra & Stage back to Region 3
-        // ---------------------------------------------------------------------------------
         // Load dq_intra from Region 3 (sDq_mma) into accumulator tCrC_dq
         #pragma unroll
         for (int i = 0; i < size(tCrC_dq); ++i) {
@@ -376,9 +337,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
             }
         }
 
-        // ---------------------------------------------------------------------------------
         // Step 3.2 - GEMM 2: dS += G^T @ Q, Prefetch next iteration & GEMM 3: Q_S = Q @ S^T
-        // ---------------------------------------------------------------------------------
         // LDSM_T reads G^T from Region 2, LDSM_T reads Q from Region 4
         cute::copy(s2r_copy_a_mn, s2r_thr_copy_a_mn.partition_S(sA_G2), tCrA_mn_view);
         cute::copy(s2r_copy_b_mn, s2r_thr_copy_b_mn.partition_S(sB_G2), tCrB_mn_view);
@@ -425,9 +384,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
 
         __syncthreads(); // [SYNC 2] (RAW: dq_total written to Region 3; WAR: all warps finished reading G from Region 2 and Q from Region 4)
 
-        // ---------------------------------------------------------------------------------
         // Step 3.3 - Write dq_total from Region 3 to GMEM (uint4) & Update Regions 2, 3, 4
-        // ---------------------------------------------------------------------------------
         // Use TiledCopy uint4 to read dq_total from Region 3 and write 128-bit stores to GMEM gdQ
         #pragma unroll
         for (int st = 0; st < NUM_STPS; ++st) {
@@ -467,9 +424,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
         }
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - Final Epilogue & GMEM Stores
-    // -------------------------------------------------------------------------------------
     __syncthreads(); // Ensure all warps have finished loop g
 
     // 1. Quad reduction (warp shuffle) for r_dc_inter
@@ -555,7 +510,6 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     }
 }
 
-// -----------------------------------------------------------------------------------------
 // Dynamic Shared Memory Structure for kernel_output_combine_dq_dk_dv (57,600 bytes = 56.25 KB)
 template <typename T, int CHUNK_SIZE, int D_K, int D_V>
 struct SmemStorageKernel1 {
@@ -569,32 +523,7 @@ struct SmemStorageKernel1 {
     alignas(16) float s_c[CHUNK_SIZE];             // 256 bytes: log_alpha_cumsum
 };
 
-// -----------------------------------------------------------------------------------------
-// Kernel 1: kernel_output_combine_dq_dk_dv
-// -----------------------------------------------------------------------------------------
-// Execution Flow Summary:
-// - Grid: (num_kv_heads, num_chunks), Block: 128 threads (4 warps with TiledMMA Shape<_4, _1, _1>).
-// - Dynamic Shared Memory 56.25 KB (57,600 bytes < 63 KB):
-//   * Region 1 (smem_1 - 8 KB): dO of current group g.
-//   * Region 2 (smem_2 - 8 KB): Q of current group g; stages dk in final epilogue.
-//   * Region 3 (smem_3 - 8 KB): Stationary V_new throughout kernel.
-//   * Region 4 (smem_4 - 8 KB): Stationary K_scaled throughout kernel.
-//   * Region 5 (smem_5 - 8 KB): Dedicated smem_work (transpose dR^T -> dR & dq_intra staging).
-//   * Region 6 (smem_6 - 8 KB): smem_dD accumulates dD^T (FP16, Swizzle<3,3,3>).
-//   * Region 7 (smem_7 - 8 KB): smem_dv accumulates dv (FP16, Swizzle<3,3,3>).
-//   * s_c[64] (256 bytes): Stationary log_alpha_cumsum.
-// - Register & SMEM Resource Management:
-//   * Single pair of fragments (tCrA, tCrB) reused across all GEMMs.
-//   * Auxiliary fragment r_dAT_h (16 regs, 32 halves) to hold dA^T and dR^T.
-//   * Single permanent accumulator tCrC_dk (32 regs FP32).
-//   * Single temporary accumulator tCrC_tmp (32 regs FP32 - reused for GEMMs 1, 2, 4, 5).
-//   * Single buffer array r_staging[NUM_STPS] (16 regs FP16).
-// - Prologue:
-//   * 2-Warp Scan log_alpha_cumsum written directly into smem.s_c[CHUNK_SIZE].
-//   * Initialize Region 6 (smem_dD) = 0 and Region 7 (smem_dv) = 0 via uint4(0) vector stores.
-//   * Recompute K_scaled (Region 4) and V_new (Region 3).
-//   * Load dO (group 0) into Region 1, Q (group 0) into Region 2.
-//   * Initialize clear(tCrC_dk). [SYNC 0].
+// kernel_output_combine_dq_dk_dv
 template <
     typename T,
     int NUM_THREADS,
@@ -629,9 +558,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
     int64_t num_chunks,                         // scalar [int64]
     int64_t total_L                             // scalar [int64]
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Thread & Block Indexing
-    // -------------------------------------------------------------------------------------
     int h_kv       = blockIdx.x;
     int curr_chunk = blockIdx.y;
     int tid        = threadIdx.x;
@@ -771,9 +698,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
     // Reused for prologue and prefetching dO_next
     decltype(make_fragment_like(dummy_part)) r_staging[NUM_STPS];
 
-    // -------------------------------------------------------------------------------------
     // Stage 1.1 - 2-Warp Prefix Scan for log_alpha_cumsum written to smem.s_c[CHUNK_SIZE]
-    // -------------------------------------------------------------------------------------
     if (tid < CHUNK_SIZE) {
         float alpha_val = 0.0f;
         if (tid < valid_len) {
@@ -807,9 +732,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
         p_dv_u4[i * 128 + tid] = zero_u4;
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Prologue: Recompute K_scaled (Region 4), V_new (Region 3), dO_0 (Region 1), Q_0 (Region 2)
-    // -------------------------------------------------------------------------------------
     int64_t k_offset_curr  = kv_head_offset * D_K + (int64_t)chunk_start * D_K;
     int64_t v_offset_curr  = kv_head_offset * D_V + (int64_t)chunk_start * D_V;
     const T* p_gamma_chunk = gGamma + kv_head_offset;
@@ -933,16 +856,12 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
     }
     __syncthreads(); // [SYNC 0] (RAW: dO in Region 1, Q in Region 2, V_new in Region 3, K_scaled in Region 4)
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Sequential Loop over Query Heads in GQA Group (g = 0..num_groups - 1)
-    // -------------------------------------------------------------------------------------
     for (int64_t g = 0; g < num_groups; ++g) {
         int64_t curr_h_q = (int64_t)h_kv * num_groups + g;
 
-        // ---------------------------------------------------------------------------------
         // Step 3.1 - GEMM 1: dA^T = V_new @ dO^T & GEMM 2: R^T = K_scaled @ Q^T
         // (Reuses tCrC_tmp and performs numerically stable exp)
-        // ---------------------------------------------------------------------------------
         // GEMM 1: V_new (Region 3) @ dO^T (Region 1)
         cute::copy(s2r_copy_a_km, s2r_thr_copy_a_km.partition_S(sA_G1_V),  tCrA_km_view);
         cute::copy(s2r_copy_b_km, s2r_thr_copy_b_km.partition_S(sB_G1_dO), tCrB_km_view);
@@ -1016,9 +935,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
             r_dAT_h(4 * n + 3) = float_to_out<T>(dat_3 * e_b1);
         }
 
-        // ---------------------------------------------------------------------------------
         // Step 3.2 - Write dR^T to Region 5, Accumulate dv into Region 7, and Compute dk
-        // ---------------------------------------------------------------------------------
         // 1. Write dR^T (half2) to Region 5 (smem_work with Swizzle)
         #pragma unroll
         for (int n = 0; n < 8; ++n) {
@@ -1086,9 +1003,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
 
         __syncthreads(); // [SYNC 1] (RAW: dR^T in Region 5 ready for LDSM_T; WAR: all warps finished reading dO in Region 1 and Q in Region 2)
 
-        // ---------------------------------------------------------------------------------
         // Step 3.3 - Load dO_next, Q_next, Compute dq_intra = dR @ K_scaled & Stage via Region 5
-        // ---------------------------------------------------------------------------------
         if (g + 1 < num_groups) {
         // Write dO_next from r_staging into Region 1 (sdO_flat)
             #pragma unroll
@@ -1148,9 +1063,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
         }
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - Final Epilogue & GMEM Stores
-    // -------------------------------------------------------------------------------------
     __syncthreads(); // Ensure all warps finished loop g
 
     // Stage tCrC_dk (FP16) into Region 2 (sQ_flat with Swizzle<3, 3, 3>)
@@ -1188,26 +1101,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
     }
 }
 
-// -----------------------------------------------------------------------------------------
-// Kernel 3: kernel_output_combine_dc_total
-// -----------------------------------------------------------------------------------------
-// Execution Flow Summary:
-// - Grid: (num_kv_heads, num_chunks), Block: 128 threads (4 warps).
-// - Reads aggregated dD^T(j, i) matrix accumulated across query heads g by Kernel 1.
-// - Computes dc_intra gradient:
-//   * Stage 1: 2-Warp Scan computing intra-chunk c_t = cumsum(alpha) from gAlpha (FP16).
-//   * Stage 2: Traverses 64x64 dD^T matrix in 4 steps (16 rows x 64 columns per step).
-//     - Cache c_i (8 columns) in private thread registers r_c_i to avoid bank conflicts.
-//     - For each causal pair (j, i) with i >= j:
-//       M_{ji} = dD^T(j, i) * exp(c_i - c_j)
-//     - Warp reduction for row sum of row j across 8 threads of same row -> store into s_da_row[j].
-//     - Accumulate col_da[k] across 4 steps and warp reduction across 4 rows in warp.
-//     - Store into s_warp_col with column swizzle col ^ ((col >= 32) ? 4 : 0) to avoid bank conflicts.
-//   * Stage 3: First 64 threads (tid < 64):
-//     - Read s_warp_col with de-swizzle -> col_sum_t.
-//     - dc_intra = col_sum - row_sum.
-//     - Read dc_inter from gDcTotal (written by Kernel 2).
-//     - Overwrite in-place da_total = dc_intra + dc_inter into gDcTotal.
+// kernel_output_combine_dc_total
 template <
     typename T,
     int NUM_THREADS,
@@ -1248,9 +1142,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_total(
     };
     __shared__ SmemStorageDcTotal smem;
 
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Load alpha and Compute Local log_alpha_cumsum
-    // -------------------------------------------------------------------------------------
     if (tid < CHUNK_SIZE) {
         float alpha_val = 0.0f;
         if (tid < valid_len) {
@@ -1276,9 +1168,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_total(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Compute Row Sum and Column Sum from dD^T Matrix
-    // -------------------------------------------------------------------------------------
     constexpr int NUM_STPS     = 4;
     constexpr int ROWS_PER_STP = CHUNK_SIZE / NUM_STPS; // 16 rows
 
@@ -1353,9 +1243,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_total(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - First 64 threads synthesize da_total = dc_intra + dc_inter & store to GMEM
-    // -------------------------------------------------------------------------------------
     if (tid < CHUNK_SIZE) {
         int t = tid;
         if (t < valid_len) {
@@ -1373,45 +1261,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_total(
     }
 }
 
+// HOST COORDINATOR FUNCTION (output_combine_bwd)
 
-
-
-
-
-
-
-
-
-
-
-// =========================================================================================
-// SECTION 2: HOST COORDINATOR FUNCTION (output_combine_bwd)
-// =========================================================================================
-// =========================================================================================
-
-// -----------------------------------------------------------------------------------------
-// Host Function: output_combine_bwd
-// -----------------------------------------------------------------------------------------
-// Execution Flow Summary:
-// - Validates input tensors (contiguous, CUDA, valid shapes & dtypes, GQA compatibility).
-// - Computes chunk offsets and valid lengths from cu_seq_lens.
-// - Allocates output tensors: dq (FP16), dk_ext (FP16), dv_ext (FP16), da_ext (FP32), dS (FP16).
-// - Allocates single intermediate buffer dD_buf (FP16) of shape (Hkv, num_chunks, 64, 64).
-//   Replaces old intermediate buffers with direct in-kernel recomputation.
-// - da_ext initialized to zeros: Kernel 2 writes dc_inter into da_ext; Kernel 3
-//   reads dc_inter and overwrites da_total in-place into da_ext.
-// - Launches 3 sequential kernels on CUDA stream:
-//   1. Kernel 1: kernel_output_combine_dq_dk_dv (Grid: Hkv, num_chunks) - computes dq_intra, dk, dv, dD^T.
-//   2. Kernel 2: kernel_output_combine_dc_inter_dS (Grid: Hkv, num_chunks) - dq_intra -> dq_total, dS, dc_inter.
-//   3. Kernel 3: kernel_output_combine_dc_total (Grid: Hkv, num_chunks) - combines da_total = dc_intra + dc_inter.
-// - Returns std::tuple: (dq, dk_ext, dv_ext, da_ext, dS).
-// Output Shapes:
-//   1. dq:     (num_q_heads, total_L, d_k) [FP16]
-//   2. dk_ext: (num_kv_heads, total_L, d_k) [FP16]
-//   3. dv_ext: (num_kv_heads, total_L, d_v) [FP16]
-//   4. da_ext: (num_kv_heads, total_L, 1) [FP32]
-//   5. dS:     (num_kv_heads, num_chunks, d_v, d_k) [FP16]
-// -----------------------------------------------------------------------------------------
+// Host coordinator for output_combine_bwd. Outputs: (dq, dk_ext, dv_ext, da_ext [FP32], dS).
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 output_combine_bwd(
     const at::Tensor& grad_output,      // (num_q_heads, total_L, d_v) [FP16] - Upstream gradient dO
@@ -1430,9 +1282,7 @@ output_combine_bwd(
     int64_t d_v,                        // scalar [int64] - Head dimension Value (default: 64)
     int64_t chunk_size                  // scalar [int64] - Chunk size (default: 64)
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     TORCH_CHECK(grad_output.is_cuda(), "grad_output must be a CUDA tensor");
     const c10::cuda::CUDAGuard device_guard(grad_output.device());
 
@@ -1486,9 +1336,7 @@ output_combine_bwd(
     // Compute chunk_offsets and chunk_valid_lens
     auto [chunk_offsets, chunk_valid_lens, num_chunks] = compute_chunk_offsets_and_valid_lens(cu_seq_lens, chunk_size);
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Memory Allocation for Outputs and Intermediate dD Buffer
-    // -------------------------------------------------------------------------------------
     auto options_half  = grad_output.options();
     auto options_float = grad_output.options().dtype(at::kFloat);
 
@@ -1558,9 +1406,7 @@ output_combine_bwd(
         make_layout(make_shape(Int<1>{}, Int<8>{}), LayoutRight{})
     ));
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Launch Sequential 3 Kernels on CUDA Stream
-    // -------------------------------------------------------------------------------------
 
     // 1. Launch Kernel 1: kernel_output_combine_dq_dk_dv (Computes dq_intra, dk, dv, dD^T)
     {
@@ -1628,9 +1474,7 @@ output_combine_bwd(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - Return Output Tuple
-    // -------------------------------------------------------------------------------------
     dD_buf.reset();
 
     return std::make_tuple(dq, dk_ext, dv_ext, da_ext, dS);

@@ -14,10 +14,8 @@
 
 using namespace cute;
 
-// -----------------------------------------------------------------------------------------
-// Helper functions for transcendental functions using half/half2
-// Clamped to avoid FP16 overflow/underflow on SM75+
-// -----------------------------------------------------------------------------------------
+// Half/half2 transcendental helpers (clamped to prevent FP16 overflow/underflow)
+
 __device__ __forceinline__ __half fast_softplus_h(__half x) {
     __half limit = __float2half(10.0f);
     if (__hgt(x, limit)) {
@@ -65,9 +63,8 @@ __device__ __forceinline__ float stable_log_sigmoid(float a) {
 
 #ifndef DELTANET_SIGMOID_HALF2_DEFINED
 #define DELTANET_SIGMOID_HALF2_DEFINED
-// -----------------------------------------------------------------------------------------
-// Fast vectorized Sigmoid for packed 2-element half2 using native FP16 intrinsics
-// -----------------------------------------------------------------------------------------
+
+// Fast half2 sigmoid using base-2 exponential and reciprocal
 __device__ __forceinline__ half2 sigmoid_half2(half2 x) {
     half2 neg_log2e = __float2half2_rn(-1.442695f);
     half2 scaled_x  = __hmul2(x, neg_log2e);
@@ -77,9 +74,7 @@ __device__ __forceinline__ half2 sigmoid_half2(half2 x) {
     return h2rcp(denom);
 }
 
-// -----------------------------------------------------------------------------------------
 // Warp-level sum reduction in FP32
-// -----------------------------------------------------------------------------------------
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -88,16 +83,11 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// -----------------------------------------------------------------------------------------
-// Helper: Transpose 4x4 uint32_t matrix (containing 4x8 FP16 elements) across 4 lanes in a quad.
-// Initial state: Each lane in quad holds 4 uint32_t fragments (2 FP16 each) across 4 consecutive steps.
-// Post-transpose: Each lane holds contiguous 8 FP16 (4 uint32_t = 128-bit uint4) for a single step,
-// enabling contiguous 128-bit vectorized stores to GMEM without fragmentation.
-// -----------------------------------------------------------------------------------------
+// Transpose 4x4 uint32_t matrix across a 4-lane quad for contiguous 128-bit stores
 __device__ __forceinline__ void quad_transpose_4x4_u32(
     uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3, int lane_in_quad
 ) {
-    // Step 1: Swap bit 0 between adjacent lanes (mask = 1)
+    // Swap bit 0 between adjacent lanes
     uint32_t s0 = ((lane_in_quad & 1) == 0) ? v1 : v0;
     uint32_t s1 = ((lane_in_quad & 1) == 0) ? v3 : v2;
     uint32_t r0 = __shfl_xor_sync(0xffffffff, s0, 1);
@@ -110,7 +100,7 @@ __device__ __forceinline__ void quad_transpose_4x4_u32(
         v2 = r1;
     }
 
-    // Step 2: Swap bit 1 between lane pairs separated by 2 (mask = 2)
+    // Swap bit 1 between lane pairs separated by 2
     uint32_t s2 = ((lane_in_quad & 2) == 0) ? v2 : v0;
     uint32_t s3 = ((lane_in_quad & 2) == 0) ? v3 : v1;
     uint32_t r2 = __shfl_xor_sync(0xffffffff, s2, 2);
@@ -125,9 +115,8 @@ __device__ __forceinline__ void quad_transpose_4x4_u32(
 }
 #endif
 
-// -----------------------------------------------------------------------------------------
-// Data conversion helper functions compatible with -D__CUDA_NO_HALF_CONVERSIONS__
-// -----------------------------------------------------------------------------------------
+// Type conversion helpers compatible with -D__CUDA_NO_HALF_CONVERSIONS__
+
 template <typename InT>
 __device__ __forceinline__ float half_to_float(InT val) {
     return __half2float(reinterpret_cast<const __half&>(val));

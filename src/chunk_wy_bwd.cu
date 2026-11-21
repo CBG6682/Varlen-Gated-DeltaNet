@@ -21,40 +21,7 @@
 
 using namespace cute;
 
-// =========================================================================================
-// SECTION 1: GLOBAL KERNEL (kernel_chunk_wy_bwd)
-// =========================================================================================
-// Execution Summary:
-//   Stage 1 - Setup & Grid Initialization:
-//     - chunk_idx = blockIdx.x, head_idx = blockIdx.y.
-//     - Determine chunk boundaries (chunk_start_token, chunk_end_token, valid_tokens) from chunk_offsets.
-//     - Intra-chunk warp prefix scan to compute log_alpha_cumsum: borrow smem.sD temporarily,
-//       cache decay_t and chunk_last_val in private registers r_decay_t[NUM_STPS], then free smem.sD.
-//   Stage 2 - Forward Recomputation:
-//     - Load K, V, B, W via UniversalCopy<uint4> across 4 sub-steps.
-//     - Recompute gamma activation, L2-norm of K, K_scaled, U, V_new, K_decay.
-//     - Store U in smem.sU, V_new in smem.sV, K_decay in smem.sK.
-//   Stage 3 - GEMM with dY:
-//     - Load dY from GMEM into smem.sD.
-//     - GEMM 1: dv_accum = K_decay @ dY^T -> convert to FP16, store in smem.sV.
-//     - GEMM 2: dk_Y = V_new @ dY -> accumulate in FP32 fragment tCrC_DK.
-//   Stage 4 - GEMM with dW:
-//     - Load dW from GMEM into smem.sD (overwriting dY).
-//     - GEMM 3: du_accum = K_decay @ dW^T -> du = -du_accum, store in smem.sU.
-//     - GEMM 4: tCrC_DK += (-U) @ dW -> dk_decay = V_new @ dY - U @ dW, store in smem.sK.
-//   Stage 5 - Recurrence Epilogue & Backward Activations:
-//     - Load du, dv_accum, dk_decay from SMEM; load dk_ext, dv_ext from GMEM.
-//     - Reuse smem.sD as buffer for s_da and s_warp_shared.
-//     - Compute dv_total = dv_accum + dv_ext.
-//     - Compute dk_total = dk_decay * decay_t + du * sigmoid(B) + dk_ext.
-//     - Compute term_t = dk_decay * k_decay, record s_da[local_row] = -sum(term_t).
-//     - Analytical backward gradients: db_raw, dw_raw, dv_raw, dk_raw, dgamma_raw -> write to GMEM.
-//   Stage 6 - Gradient Alpha (dalpha_raw):
-//     - Accumulate total_term_sum + d_trace * exp(c_last) into s_da[valid_tokens - 1].
-//     - Add da_ext into s_da[t].
-//     - 2-Warp reverse suffix scan: G_i = dL/d(ln sigma(alpha_i)).
-//     - Compute dalpha_raw = G_i * (1 - sigmoid(alpha_raw)) -> write to GMEM.
-// =========================================================================================
+// Chunk WY backward kernel computing raw input gradients (dk, dv, db, dw, dgamma, da).
 template <
     typename T,
     int NUM_THREADS,
@@ -92,9 +59,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     int64_t total_L,                           // scalar [int64] - Total tokens
     int64_t num_chunks                         // scalar [int64] - Total chunks
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Setup & Grid Initialization
-    // -------------------------------------------------------------------------------------
     int chunk_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int tid       = threadIdx.x;
@@ -183,10 +148,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
         return;
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 1.1 - 2-Warp Prefix Scan for log_alpha_cumsum
     // Temporarily use smem.sD as exchange buffer
-    // -------------------------------------------------------------------------------------
     float* s_temp_log_alpha = reinterpret_cast<float*>(smem.sD);
     float* s_temp_warp0_sum = reinterpret_cast<float*>(smem.sD) + CHUNK_SIZE;
 
@@ -226,9 +189,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     }
     __syncthreads(); // Release smem.sD
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Forward Recompute: U, V_new, K_decay into sU, sV, sK
-    // -------------------------------------------------------------------------------------
     const T* p_k_chunk      = gK      + head_offset * D_K + (int64_t)chunk_start_token * D_K;
     const T* p_v_chunk      = gV      + head_offset * D_V + (int64_t)chunk_start_token * D_V;
     const T* p_b_chunk      = gB      + head_offset * D_K + (int64_t)chunk_start_token * D_K;
@@ -331,9 +292,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - GEMM with dY: dv_accum = K_decay @ dY^T and dk_Y = V_new @ dY
-    // -------------------------------------------------------------------------------------
     int64_t mat_offset_y = ((int64_t)head_idx * num_chunks + chunk_idx) * ((int64_t)D_V * D_K);
     const T* p_dy_chunk = gdY + mat_offset_y;
     auto gDY_chunk = make_tensor(make_gmem_ptr(p_dy_chunk), make_layout(make_shape(Int<D_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
@@ -374,9 +333,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     cute::copy(rC_half_DV, thr_mma.partition_C(make_tensor(make_smem_ptr(smem.sV), smem_layout_mma_C)));
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - GEMM with dW: du_accum = K_decay @ dW^T and tCrC_DK += (-U) @ dW
-    // -------------------------------------------------------------------------------------
     int64_t mat_offset_w = ((int64_t)head_idx * num_chunks + chunk_idx) * ((int64_t)D_K * D_K);
     const T* p_dw_chunk = gdW + mat_offset_w;
     auto gDW_chunk = make_tensor(make_gmem_ptr(p_dw_chunk), make_layout(make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
@@ -426,10 +383,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     cute::copy(rC_half_DK, thr_mma.partition_C(make_tensor(make_smem_ptr(smem.sK), smem_layout_mma_C)));
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 5 - Recurrence Epilogue & Backward Activations
     // Reuse smem.sD as buffer for s_da and s_warp_shared
-    // -------------------------------------------------------------------------------------
     float* s_da          = reinterpret_cast<float*>(smem.sD);
     float* s_warp_shared = reinterpret_cast<float*>(smem.sD) + CHUNK_SIZE;
 
@@ -671,9 +626,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 6 - Gradient Alpha (dalpha_raw) via 2-Warp Reverse Suffix Scan
-    // -------------------------------------------------------------------------------------
     if (tid == 0) {
         float total_term_sum = 0.0f;
         for (int t = 0; t < valid_tokens; ++t) {
@@ -720,9 +673,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     }
 }
 
-// =========================================================================================
-// SECTION 2: HOST FUNCTION (chunk_wy_bwd)
-// =========================================================================================
+// HOST FUNCTION (chunk_wy_bwd)
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 chunk_wy_bwd(
@@ -740,9 +691,7 @@ chunk_wy_bwd(
     const at::Tensor& da_ext,          // (num_kv_heads, total_L, 1) [FP32] - External log alpha gradient
     int64_t chunk_size                 // scalar [int64] - Chunk size (default 64)
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     at::cuda::CUDAGuard device_guard(k.device());
 
     TORCH_CHECK(dW.is_cuda() && dY.is_cuda(), "dW and dY must be CUDA tensors");
@@ -778,9 +727,7 @@ chunk_wy_bwd(
     TORCH_CHECK(d_k == 64, "d_k must be 64");
     TORCH_CHECK(d_v == 64, "d_v must be 64");
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Kernel Launch
-    // -------------------------------------------------------------------------------------
     auto [chunk_offsets_gpu, chunk_valid_lens_gpu, num_chunks] = compute_chunk_offsets_and_valid_lens(cu_seq_lens, chunk_size);
 
     auto options = k.options();
@@ -875,8 +822,6 @@ chunk_wy_bwd(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Return Results
-    // -------------------------------------------------------------------------------------
     return std::make_tuple(dk, dv, db, dw, dgamma, da);
 }

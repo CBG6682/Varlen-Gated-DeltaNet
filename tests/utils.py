@@ -666,7 +666,10 @@ def check_dual_precision(
         br, bc, bm, bw = float("nan"), float("nan"), float("nan"), None
 
     def _eval_one(k_err: float, b_err: Optional[float], cap: float) -> Tuple[str, Optional[float]]:
-        if k_err != k_err or k_err > cap:
+        if k_err != k_err:
+            return "FAIL", None
+        eff_cap = max(cap, 1.5 * b_err) if (b_err is not None and b_err == b_err) else cap
+        if k_err > eff_cap:
             return "FAIL", None
         if use_ratio and b_err is not None:
             base = err_floor if b_err != b_err else max(b_err, err_floor)

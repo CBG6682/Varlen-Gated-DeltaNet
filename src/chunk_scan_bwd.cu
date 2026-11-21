@@ -23,38 +23,7 @@
 
 using namespace cute;
 
-// =========================================================================================
-// SECTION 1: GLOBAL KERNEL (kernel_chunk_scan_bwd)
-// =========================================================================================
-
-// -----------------------------------------------------------------------------------------
-// Global Kernel: kernel_chunk_scan_bwd
-// -----------------------------------------------------------------------------------------
-// Execution Flow:
-// - Stage 1 - Setup & Grid Initialization:
-//   + batch_idx = blockIdx.x, head_idx = blockIdx.y, v_idx = blockIdx.z, tid = threadIdx.x.
-//   + Chunk boundaries: start_c = cu_chunk_lens[batch_idx], end_c = cu_chunk_lens[batch_idx + 1].
-//   + V slice offset: slice_offset_v = v_idx * B_V * D_K.
-//   + State layout offset (B, H, d_v, d_k): (batch_idx * gridDim.y + head_idx) * (d_v * d_k) + slice_offset_v.
-// - Stage 2 - CuTe Tensor Partitioning & Shared Memory Allocation:
-//   + Compact 10 KB SMEM: sDeltaS (2 KB for B_V x D_K), sW (8 KB for D_K x D_K, aliased as sDeltaS_accum).
-//   + Swizzle<3, 3, 3> layouts to eliminate bank conflicts.
-//   + Batched GEMM 1 (dW_c = S_c^T @ Delta_S) is deferred to cuBLAS at::bmm on Host.
-//   + Single Tensor Core GEMM in kernel: Delta_S_accum = Delta_S @ W_c^T (K-major LDSM_N).
-//   + TiledMMA with Layout<Shape<_1, _4, _1>> (1 warp vertical M=16, 4 warps horizontal N=64).
-// - Stage 3 - Buffer Initialization & Register Fragments:
-//   + NUM_STPS_V = B_V / ROWS_PER_STP (1 step), NUM_STPS_K = D_K / ROWS_PER_STP (4 steps).
-//   + Allocate register fragments once at kernel start.
-//   + Zero-length sequence handling (start_c >= end_c): write grad_final_states to grad_state_old, then return.
-//   + Load grad_final_states into sDeltaS (or initialize to zero).
-// - Stage 4 - Reverse Scan Loop c = end_c - 1 .. start_c:
-//   + 1. Prefetch W_c from GMEM into registers rW_tmp to overlap memory latency.
-//   + 2. Store gradient dY[:, c] = Delta_S to GMEM via 128-bit vectorized stores while prefetching W_c.
-//   + 3. Copy rW_tmp to SMEM sW, synchronize via __syncthreads().
-//   + 4. Perform GEMM: Delta_S_accum = Delta_S @ W_c^T, epilogue writes to sDeltaS_accum (aliased on sW).
-//   + 5. Update Delta_S_new = Delta_S_accum + grad_S_list[:, c] in sDeltaS for chunk c - 1.
-//   + At loop termination (c = start_c): if has_state_old, write Delta_S to GMEM grad_state_old[b, h].
-// -----------------------------------------------------------------------------------------
+// Chunk scan backward kernel computing grad_W, grad_Y, and grad_state_old.
 template <
     typename T,
     int NUM_THREADS,
@@ -79,9 +48,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
     int64_t num_chunks,                        // scalar [int64]
     int64_t batch_size                         // scalar [int64]
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Setup & Grid Initialization
-    // -------------------------------------------------------------------------------------
     int batch_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int v_idx     = blockIdx.z; // V slice index: 0 .. (D_V / B_V - 1)
@@ -96,10 +63,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
     int64_t slice_offset_v = (int64_t)v_idx * B_V * D_K;
     int64_t state_offset   = ((int64_t)batch_idx * gridDim.y + head_idx) * mat_elements_v + slice_offset_v;
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Shared Memory Allocation & CuTe Layouts
     // Compact 10 KB SMEM: sDeltaS (2 KB), sW (8 KB, aliased as sDeltaS_accum)
-    // -------------------------------------------------------------------------------------
     __shared__ alignas(16) T sDeltaS[B_V * D_K]; // 2 KB: Delta_S accumulator for slice (16 x 64)
     __shared__ alignas(16) T sW[D_K * D_K];      // 8 KB: full W_c matrix (64 x 64), aliased as sDeltaS_accum
 
@@ -169,10 +134,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
         clear(rW_tmp[st]);
     }
 
-    // -------------------------------------------------------------------------------------
     // Zero-length sequence handling: start_c >= end_c
     // If has_state_old: write grad_final_states (or 0) to grad_state_old
-    // -------------------------------------------------------------------------------------
     if (start_c >= end_c) {
         if (has_state_old && gGradStateOld != nullptr) {
             T* p_grad_state_old = gGradStateOld + state_offset;
@@ -200,9 +163,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
         return;
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3: Initialize Delta_S Accumulator from grad_final_states
-    // -------------------------------------------------------------------------------------
     if (gGradFinalStates != nullptr) {
         const T* p_grad_final = gGradFinalStates + state_offset;
         auto gGradFinal_chunk = make_tensor(make_gmem_ptr(p_grad_final), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
@@ -227,9 +188,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 4: Reverse Scan Loop c = end_c - 1 .. start_c
-    // -------------------------------------------------------------------------------------
     for (int32_t c = end_c - 1; c >= start_c; --c) {
         int64_t chunk_mat_offset_v = ((int64_t)head_idx * num_chunks + c) * mat_elements_v + slice_offset_v;
         int64_t chunk_mat_offset_k = ((int64_t)head_idx * num_chunks + c) * mat_elements_k;
@@ -320,9 +279,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
         __syncthreads();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 5: Write initial state gradient (grad_state_old) if requested
-    // -------------------------------------------------------------------------------------
     if (has_state_old && gGradStateOld != nullptr) {
         T* p_grad_state_old = gGradStateOld + state_offset;
         auto gGradStateOld_chunk = make_tensor(make_gmem_ptr(p_grad_state_old), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
@@ -342,9 +299,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
     }
 }
 
-// =========================================================================================
-// SECTION 2: HOST COORDINATION FUNCTION (chunk_scan_bwd)
-// =========================================================================================
+// HOST COORDINATION FUNCTION (chunk_scan_bwd)
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 chunk_scan_bwd(
@@ -356,9 +311,7 @@ chunk_scan_bwd(
     bool has_state_old,                                // scalar [bool]
     int64_t chunk_size                                 // scalar [int64] (default 64)
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     TORCH_CHECK(W.is_cuda(), "W must be a CUDA tensor");
     const c10::cuda::CUDAGuard device_guard(W.device());
 
@@ -455,9 +408,7 @@ chunk_scan_bwd(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Reverse Time Scan Kernel Launch
-    // -------------------------------------------------------------------------------------
     {
         using T = cutlass::half_t;
 
@@ -512,9 +463,7 @@ chunk_scan_bwd(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Compute grad_W via Batched GEMM (at::bmm) on Host
-    // -------------------------------------------------------------------------------------
     // Parallel GEMM (dW = S^T @ dY) across all chunks via cuBLAS bmm:
     // S_list: (num_kv_heads, num_chunks, d_v, d_k) -> flatten(0, 1) -> transpose(-1, -2) -> (H*C, d_k, d_v)
     // grad_Y: (num_kv_heads, num_chunks, d_v, d_k) -> flatten(0, 1) -> (H*C, d_v, d_k)
@@ -524,8 +473,6 @@ chunk_scan_bwd(
         grad_Y.flatten(0, 1)
     ).view_as(W);
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - Return Results
-    // -------------------------------------------------------------------------------------
     return std::make_tuple(grad_W, grad_Y, grad_state_old);
 }

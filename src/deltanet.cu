@@ -11,34 +11,9 @@
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
 
-// =========================================================================================
 // HOST COORDINATION FUNCTIONS (deltanet_fwd & deltanet_bwd)
-// =========================================================================================
 
-// -----------------------------------------------------------------------------------------
-// Host Coordinator 1: deltanet_fwd
-// -----------------------------------------------------------------------------------------
-// Execution Summary:
-// - Stage 1 - Input Validation:
-//   * Verify CUDA placement, contiguous memory layout, and FP16 dtype for raw inputs:
-//     q, k, v, w, b, a, gamma, past_states (if provided).
-//   * Verify cu_seq_lens (Int32/Int64).
-//   * Enforce architectural constraints: d_k == 64, d_v == 64, chunk_size == 64,
-//     num_q_heads % num_kv_heads == 0.
-// - Stage 2 - Forward Pipeline Execution across 3 stages:
-//   * Step 1: Call chunk_wy_fwd to compute transition matrix W and update matrix Y.
-//   * Step 2: Call chunk_scan_fwd to compute recurrent states S and final_states.
-//     Free Y. If forward_only == true, release W immediately after this step.
-//   * Step 3: Call output_combine_fwd to fuse intra-chunk attention and inter-chunk state S.
-// - Stage 3 - Return Results:
-//   * Return std::tuple: (y, final_states, W, S).
-//   * If forward_only == true, return empty tensors for W and S to conserve memory.
-// Output Shapes:
-//   1. y:            (num_q_heads, total_L, d_v)          [FP16] - Combined attention output
-//   2. final_states: (batch_size, num_kv_heads, d_v, d_k) [FP16] - Final hidden states
-//   3. W:            (num_kv_heads, num_chunks, d_k, d_k) [FP16] - Transition matrix (empty if forward_only)
-//   4. S:            (num_kv_heads, num_chunks, d_v, d_k) [FP16] - Recurrent states (empty if forward_only)
-// -----------------------------------------------------------------------------------------
+// Host coordinator for deltanet_fwd. Outputs: y (H_q, total_L, d_v), final_states (B, H_kv, d_v, d_k), W, S.
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 deltanet_fwd(
     const std::optional<at::Tensor>& past_states,          // (batch_size, num_kv_heads, d_v, d_k) [FP16] - Initial states
@@ -57,9 +32,7 @@ deltanet_fwd(
     int64_t chunk_size,                                    // scalar [int64] - Chunk size (default 64)
     bool forward_only                                      // scalar [bool] - Forward-only flag
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Data Validation
-    // -------------------------------------------------------------------------------------
     TORCH_CHECK(q.is_cuda(), "Input tensor 'q' must be a CUDA tensor");
     const c10::cuda::CUDAGuard device_guard(q.device());
 
@@ -127,9 +100,7 @@ deltanet_fwd(
         return std::make_tuple(empty_y, empty_final_states, empty_W, empty_S);
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Execute Forward 3-Stage Pipeline
-    // -------------------------------------------------------------------------------------
 
     // Step 1: Chunk WY Forward
     // Compute W and Y from raw inputs (activation recomputation)
@@ -147,11 +118,9 @@ deltanet_fwd(
         num_q_heads, num_kv_heads, d_k, d_v, chunk_size
     );
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Return Results
     // If forward_only == true: free W and S, return empty tensors
     // If forward_only == false: retain W and S for backward reuse
-    // -------------------------------------------------------------------------------------
     at::Tensor W_ret;
     at::Tensor S_ret;
     if (forward_only) {
@@ -167,32 +136,7 @@ deltanet_fwd(
     return std::make_tuple(y, final_states, W_ret, S_ret);
 }
 
-// -----------------------------------------------------------------------------------------
-// Host Coordinator 2: deltanet_bwd
-// -----------------------------------------------------------------------------------------
-// Execution Summary:
-// - Stage 1 - Input Validation:
-//   * Verify CUDA, contiguous layout, and FP16 dtype for grad_output, q, k, v, w, b, a, gamma.
-//   * Validate grad_final_states and past_states (if has_past_states == true).
-// - Stage 2 - Manage W_use and recurrent states S_list:
-//   * If both W and S are cached from forward, reuse directly, completely avoiding recomputing Y and S.
-//   * If W or S are absent: recompute only what is missing.
-// - Stage 3 - Execute Backward Pipeline across 3 stages:
-//   * Step 1: Call output_combine_bwd to compute dq, dk_ext, dv_ext, da_ext, dS.
-//   * Step 2: Call chunk_scan_bwd from dS to compute dW, dY, grad_past_states.
-//   * Step 3: Call chunk_wy_bwd from dW, dY, dk_ext, dv_ext, da_ext to compute dk, dv, db, dw, dgamma, da.
-// - Stage 4 - Return Results:
-//   * Return std::tuple: (dq, dk, dv, dw, db, da, dgamma, grad_past_states).
-// Output Shapes:
-//   1. dq:               (num_q_heads, total_L, d_k)          [FP16]
-//   2. dk:               (num_kv_heads, total_L, d_k)         [FP16]
-//   3. dv:               (num_kv_heads, total_L, d_v)         [FP16]
-//   4. dw:               (num_kv_heads, total_L, d_v)         [FP16]
-//   5. db:               (num_kv_heads, total_L, d_k)         [FP16]
-//   6. da:               (num_kv_heads, total_L, 1)           [FP16]
-//   7. dgamma:           (num_kv_heads, total_L, 1)           [FP16]
-//   8. grad_past_states: (batch_size, num_kv_heads, d_v, d_k) [FP16]
-// -----------------------------------------------------------------------------------------
+// Host coordinator for deltanet_bwd. Outputs: (dq, dk, dv, dw, db, da, dgamma, grad_past_states).
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 deltanet_bwd(
     const at::Tensor& grad_output,                         // (num_q_heads, total_L, d_v) [FP16] - Upstream gradient
@@ -215,9 +159,7 @@ deltanet_bwd(
     int64_t chunk_size,                                    // scalar [int64] - Chunk size (default 64)
     bool has_past_states                                   // scalar [bool] - Flag indicating presence of past states
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     TORCH_CHECK(grad_output.is_cuda(), "Input 'grad_output' must be a CUDA tensor");
     const c10::cuda::CUDAGuard device_guard(grad_output.device());
 
@@ -284,9 +226,7 @@ deltanet_bwd(
         return std::make_tuple(empty_dq, empty_dk, empty_dv, empty_dw, empty_db, empty_da, empty_dgamma, empty_gps);
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Manage W_use and Recurrent States S_list (Reuse from forward if cached)
-    // -------------------------------------------------------------------------------------
     at::Tensor W_use;
     at::Tensor S_list;
     bool recomputed_w = false;
@@ -323,9 +263,7 @@ deltanet_bwd(
         recomputed_s = true;
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Execute Backward Pipeline across 3 stages
-    // -------------------------------------------------------------------------------------
 
     // Step 1: Output Combine Backward
     // Compute dq, dk_ext, dv_ext, da_ext, dS from grad_output, q, raw inputs, and S
@@ -364,8 +302,6 @@ deltanet_bwd(
         W_use.reset();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - Return Results
-    // -------------------------------------------------------------------------------------
     return std::make_tuple(dq, dk, dv, dw, db, da, dgamma, grad_past_states);
 }

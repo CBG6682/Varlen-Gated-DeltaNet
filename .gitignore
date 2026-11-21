@@ -17,17 +17,14 @@ __pycache__/
 *$py.class
 .cache/
 
-# Root CUTLASS auto-clone fallback
+# Standalone root cutlass scratch directory
 /cutlass/
 
-# Local benchmark and NCU profiles (do not publish)
+# Local prompts, scratch baselines, and Nsight Compute profiles (do not publish)
 Prompt/
-benchmark/
+prompt/
 *.ncu-rep
+benchmark/*.png
 .ipynb_checkpoints/
 .vscode/
 .idea/
-
-# Keep demo notebook only, ignore other scratch notebooks
-*.ipynb
-!demo.ipynb

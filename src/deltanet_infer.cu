@@ -18,13 +18,9 @@
 
 using namespace cute;
 
-// =========================================================================================
-// SECTION 1: HELPER FUNCTIONS & GLOBAL KERNEL
-// =========================================================================================
+// HELPER FUNCTIONS & GLOBAL KERNEL
 
-// -----------------------------------------------------------------------------------------
 // Helper: 8-lane reduction sum across a group of 8 threads on the same row
-// -----------------------------------------------------------------------------------------
 __device__ __forceinline__ float octet_reduce_sum(float val) {
     val += __shfl_xor_sync(0xffffffff, val, 1);
     val += __shfl_xor_sync(0xffffffff, val, 2);
@@ -32,31 +28,13 @@ __device__ __forceinline__ float octet_reduce_sum(float val) {
     return val;
 }
 
-// -----------------------------------------------------------------------------------------
 // Shared Memory Allocation Layout (16 KB, 16-byte aligned)
-// -----------------------------------------------------------------------------------------
 struct alignas(16) SmemStorage {
     half sS[64 * 64];   // 8192 bytes: stores past_state matrix S (Swizzle<3, 3, 3>)
     half sVec[64 * 64]; // 8192 bytes: inter-warp buffer (Swizzle<3, 3, 3>)
 };
 
-// -----------------------------------------------------------------------------------------
-// Global Kernel: kernel_deltanet_infer
-// -----------------------------------------------------------------------------------------
-// Execution Flow:
-//   - Step 1: Initialize CuTe GMEM and swizzled SMEM tensors; partition tensors for S and 1D broadcast vectors.
-//   - Step 2: Issue vectorized 128-bit loads for scalars (a, gamma), broadcast vectors (k, b, v, w),
-//             and the past_state matrix S (64x64) into swizzled SMEM sS.
-//   - Step 3: Compute decay = sigmoid(a), sqrt_gamma = sqrt(softplus(gamma)), b = sigmoid(b), w = sigmoid(w).
-//   - Step 4: L2-normalize k in FP32 with 8-lane reduction; compute k_scaled and u = b * k_scaled.
-//   - Step 5: Compute v_scaled = v * sqrt_gamma, v_new = w * v_scaled.
-//   - Step 6: Compute Su = S * u, synchronize through sVec (Row 0), compute delta_v = v_new - Su,
-//             and sync delta_v through sVec (Row 1).
-//   - Step 7: Update state S_new = S_old * decay + delta_v * k_scaled^T, write S_new in-place to GMEM.
-//   - Step 8: Load broadcast vectors for all G query heads q using TiledCopyVec.
-//   - Step 9: Iterate g = 0..G-1: compute out_inter = decay * (S_old * q_g), out_intra = (q_g * k_scaled) * v_new,
-//             accumulate and write 128-bit vector to GMEM with leader-thread predication.
-// -----------------------------------------------------------------------------------------
+// Single-step (L = 1) DeltaNet decode kernel updating past_state in-place.
 template <
     typename Element,
     int NUM_THREADS,
@@ -82,9 +60,7 @@ kernel_deltanet_infer(
     int64_t num_q_heads,                        // scalar: int64_t
     int64_t num_kv_heads                        // scalar: int64_t
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Setup & CuTe Tensor Partitioning
-    // -------------------------------------------------------------------------------------
     int batch_idx = blockIdx.y;
     int head_idx  = blockIdx.x;
     int tid       = threadIdx.x;
@@ -158,9 +134,7 @@ kernel_deltanet_infer(
         make_rmem_ptr(q_buf),
         make_layout(make_shape(Int<STATIC_G>{}, Int<8>{}), LayoutRight{}));
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Issue Global Memory Loads
-    // -------------------------------------------------------------------------------------
     Element raw_a     = a_ptr[offset_scalar];
     Element raw_gamma = gamma_ptr[offset_scalar];
 
@@ -175,9 +149,7 @@ kernel_deltanet_infer(
     cute::copy(tiled_copy_s, rS, tSsS_D);
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Transcendental Function Evaluation
-    // -------------------------------------------------------------------------------------
     Element decay        = fast_sigmoid_h(raw_a);
     float   gamma_sp_f   = fmaxf(__half2float(fast_softplus_h(raw_gamma)), 0.0f);
     float   sqrt_gamma_f = sqrtf(gamma_sp_f);
@@ -192,9 +164,7 @@ kernel_deltanet_infer(
         reinterpret_cast<half2*>(r_w.data())[i] = fast_sigmoid_h2(w_pair);
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - L2-Normalize Key, Compute k_scaled and u
-    // -------------------------------------------------------------------------------------
     float sum_sq = 0.0f;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -214,18 +184,14 @@ kernel_deltanet_infer(
         r_u(i)        = __hmul(r_b(i), r_k_scaled(i));
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 5 - Compute v_new
-    // -------------------------------------------------------------------------------------
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         Element v_scaled = __hmul(r_v(i), sqrt_gamma);
         r_v_new(i)       = __hmul(r_w(i), v_scaled);
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 6 - Compute Su and delta_v
-    // -------------------------------------------------------------------------------------
     #pragma unroll
     for (int r = 0; r < 4; ++r) {
         float local_su = 0.0f;
@@ -252,9 +218,7 @@ kernel_deltanet_infer(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 7 - Compute S_new and Write In-place to GMEM
-    // -------------------------------------------------------------------------------------
     Element r_delta_v[4];
     #pragma unroll
     for (int r = 0; r < 4; ++r) {
@@ -274,9 +238,7 @@ kernel_deltanet_infer(
     // Write updated state S_new in-place to GMEM
     cute::copy(tiled_copy_s, rS_new, tSgS);
 
-    // -------------------------------------------------------------------------------------
     // Stage 8 & 9 - Loop across G heads: Compute out_inter + out_intra and Write Output
-    // -------------------------------------------------------------------------------------
     if constexpr (FIXED_G > 0) {
         #pragma unroll
         for (int g = 0; g < FIXED_G; ++g) {
@@ -381,9 +343,7 @@ kernel_deltanet_infer(
     }
 }
 
-// =========================================================================================
-// SECTION 2: HOST FUNCTION (deltanet_infer)
-// =========================================================================================
+// HOST FUNCTION (deltanet_infer)
 
 std::tuple<at::Tensor, at::Tensor>
 deltanet_infer(
@@ -400,9 +360,7 @@ deltanet_infer(
     int64_t d_k,                        // scalar: int64_t (default 64)
     int64_t d_v                         // scalar: int64_t (default 64)
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     TORCH_CHECK(past_state.is_cuda(), "Input tensor 'past_state' must be a CUDA tensor");
     const c10::cuda::CUDAGuard device_guard(past_state.device());
 
@@ -475,9 +433,7 @@ deltanet_infer(
     TORCH_CHECK(a.numel() == B * H, "Tensor 'a' must have B * H elements");
     TORCH_CHECK(gamma.numel() == B * H, "Tensor 'gamma' must have B * H elements");
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Kernel Execution
-    // -------------------------------------------------------------------------------------
     at::Tensor out = torch::empty({B, num_q_heads, d_v}, q.options());
 
     constexpr int NUM_THREADS = 128;
@@ -559,8 +515,6 @@ deltanet_infer(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Return Results
-    // -------------------------------------------------------------------------------------
     return std::make_tuple(out, past_state);
 }

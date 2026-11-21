@@ -153,6 +153,14 @@ existing_prebuilt = get_existing_prebuilt()
 
 if force_rebuild:
     print("[setup.py] FORCE_REBUILD=1 requested: Recompiling CUDA extension from source...")
+    pkg_dir = os.path.join(THIS_DIR, "deltanet_v2")
+    if os.path.isdir(pkg_dir):
+        for fname in os.listdir(pkg_dir):
+            if fname.startswith("_C") and fname.endswith(".so"):
+                os.remove(os.path.join(pkg_dir, fname))
+    build_dir = os.path.join(THIS_DIR, "build")
+    if os.path.isdir(build_dir):
+        shutil.rmtree(build_dir, ignore_errors=True)
     should_compile = True
 elif existing_prebuilt is not None:
     print(f"[setup.py] Pre-compiled extension found: {os.path.basename(existing_prebuilt)}. Skipping compilation.")

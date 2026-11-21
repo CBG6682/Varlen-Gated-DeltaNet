@@ -21,36 +21,7 @@
 
 using namespace cute;
 
-// =========================================================================================
-// SECTION 1: GLOBAL KERNEL (kernel_chunk_wy_fwd)
-// =========================================================================================
-// Execution Summary:
-//   Stage 1 - Setup & Grid Initialization:
-//     - chunk_idx = blockIdx.x, head_idx = blockIdx.y.
-//     - Determine chunk boundaries (chunk_start_token, chunk_end_token, valid_tokens) from chunk_offsets.
-//     - Intra-chunk warp prefix scan (Warp 0 & 1) to compute log_alpha_cumsum from raw alpha.
-//     - Extract chunk_last_val = exp(log_alpha_cumsum[valid_tokens - 1]).
-//   Stage 2 - Load & Recompute Activations for K, B, U, K_decay:
-//     - Sub-step loads (16 rows/step x 4 steps = 64 rows): load K, B via UniversalCopy<uint4>.
-//     - Compute gamma activation: sqrt_gamma = sqrt(softplus(gamma) + 1e-4), store in r_sqrt_gamma_h2.
-//     - L2-norm of K via 8-lane intra-row warp reduction: k_norm = ||K||_2.
-//     - Compute K_scaled = K * sqrt_gamma / k_norm.
-//     - Compute U = sigmoid(B) * K_scaled, store in SMEM sU.
-//     - Compute K_decay = K_scaled * exp(c_last - c_t), store in SMEM sK.
-//     - Synchronize via __syncthreads().
-//   Stage 3 - GEMM 1: Transition Matrix W & V_new Generation (Tensor Core SM75+):
-//     - Prefetch V and W_gate into registers before GEMM to overlap memory latency.
-//     - Load U^T and K_decay from SMEM sU, sK via LDSM into tCrA, tCrB registers.
-//     - Tensor Core MMA: erase = U^T @ K_decay (64x64, FP32 accumulators).
-//     - Epilogue W:
-//         + Write W = I * chunk_last_val - erase to SMEM sW (aliased on sU) and store to GMEM gW.
-//         + Compute V_new = sigmoid(W_gate) * (V * sqrt_gamma) and store into SMEM sV.
-//         + Synchronize via __syncthreads().
-//   Stage 4 - GEMM 2: Update Matrix Y (Tensor Core SM75+):
-//     - Load V_new^T and K_decay from SMEM sV, sK via LDSM into tCrA, tCrB registers.
-//     - Tensor Core MMA: Y = V_new^T @ K_decay (64x64, FP32 accumulators).
-//     - Epilogue: Store to SMEM sY (aliased on sV) and write to GMEM gY via 128-bit vectorized stores.
-// =========================================================================================
+// Chunk WY forward kernel computing transition matrix W and update matrix Y.
 template <
     typename T,
     int NUM_THREADS,
@@ -77,9 +48,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
     int64_t total_L,                           // scalar [int64] - Total tokens
     int64_t num_chunks                         // scalar [int64] - Total chunks
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Setup & Grid Initialization
-    // -------------------------------------------------------------------------------------
     int chunk_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int tid       = threadIdx.x;
@@ -179,9 +148,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
         return;
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 1.1 - Prefix Scan for log_alpha_cumsum inside chunk
-    // -------------------------------------------------------------------------------------
     if (tid < CHUNK_SIZE) {
         float alpha_val = 0.0f;
         if (tid < valid_tokens) {
@@ -210,9 +177,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
 
     float chunk_last_val = expf(s_log_alpha[valid_tokens - 1]);
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Load & Recompute Activations for K, B, U, K_decay
-    // -------------------------------------------------------------------------------------
     const T* p_k_chunk      = gK      + head_offset * D_K + (int64_t)chunk_start_token * D_K;
     const T* p_v_chunk      = gV      + head_offset * D_V + (int64_t)chunk_start_token * D_V;
     const T* p_b_chunk      = gB      + head_offset * D_K + (int64_t)chunk_start_token * D_K;
@@ -309,9 +274,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - GEMM 1: Transition Matrix W & V_new Generation (Tensor Core)
-    // -------------------------------------------------------------------------------------
     // Prefetch V and W_gate to overlap GMEM latency
     decltype(make_fragment_like(dummy_part)) rV[NUM_STPS];
     decltype(make_fragment_like(dummy_part)) rW_g[NUM_STPS];
@@ -401,9 +364,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 4 - GEMM 2: Update Matrix Y (Tensor Core)
-    // -------------------------------------------------------------------------------------
     auto tCrC_Y = thr_mma.make_fragment_C(tCsC_Y);
     clear(tCrC_Y);
 
@@ -441,9 +402,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
     }
 }
 
-// =========================================================================================
-// SECTION 2: HOST FUNCTION (chunk_wy_fwd)
-// =========================================================================================
+// HOST FUNCTION (chunk_wy_fwd)
 
 std::tuple<at::Tensor, at::Tensor>
 chunk_wy_fwd(
@@ -456,9 +415,7 @@ chunk_wy_fwd(
     const at::Tensor& cu_seq_lens,     // (batch_size + 1,) [Int32 / Int64] - Cumulative sequence lengths
     int64_t chunk_size                 // scalar [int64] - Chunk size (default 64)
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     at::cuda::CUDAGuard device_guard(k.device());
 
     TORCH_CHECK(k.is_cuda(), "k must be a CUDA tensor");
@@ -502,9 +459,7 @@ chunk_wy_fwd(
     TORCH_CHECK(gamma.size(0) == num_kv_heads && gamma.size(1) == total_L, "gamma shape mismatch");
     TORCH_CHECK(a.size(0) == num_kv_heads && a.size(1) == total_L, "a shape mismatch");
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Kernel Launch
-    // -------------------------------------------------------------------------------------
     auto [chunk_offsets_gpu, chunk_valid_lens_gpu, num_chunks] = compute_chunk_offsets_and_valid_lens(cu_seq_lens, chunk_size);
 
     auto options = k.options();
@@ -577,8 +532,6 @@ chunk_wy_fwd(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Return Results
-    // -------------------------------------------------------------------------------------
     return std::make_tuple(W, Y);
 }

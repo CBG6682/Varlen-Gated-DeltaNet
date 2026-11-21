@@ -23,40 +23,7 @@
 
 using namespace cute;
 
-// =========================================================================================
-// SECTION 1: GLOBAL KERNEL (kernel_chunk_scan_fwd)
-// =========================================================================================
-
-// -----------------------------------------------------------------------------------------
-// Global Kernel: kernel_chunk_scan_fwd
-// -----------------------------------------------------------------------------------------
-// Execution Flow:
-// - Stage 1 - Setup & Grid Initialization:
-//   + batch_idx = blockIdx.x, head_idx = blockIdx.y, v_idx = blockIdx.z, tid = threadIdx.x.
-//   + Sequence chunk boundaries: start_c = cu_chunk_lens[batch_idx], end_c = cu_chunk_lens[batch_idx + 1].
-//   + V-dimension slice offset: slice_offset_v = v_idx * B_V * D_K.
-//   + State layout offset (B, H, d_v, d_k): (batch_idx * gridDim.y + head_idx) * (d_v * d_k) + slice_offset_v.
-// - Stage 2 - CuTe Tensor Partitioning & Shared Memory Allocation:
-//   + Compact 12 KB SMEM: sS (2 KB for B_V x D_K), sW (8 KB for D_K x D_K), sY (2 KB for B_V x D_K).
-//   + Swizzle<3, 3, 3> layouts to eliminate bank conflicts.
-//   + Partition sS_mma (Operand A), sW_mma (Operand B), sY_mma (Operand C) with TiledMMA Layout<Shape<_1, _4, _1>>.
-//   + S2R loads via explicit LDSM copy atoms: SM75_U32x2_LDSM_N for A (K-major) and SM75_U16x2_LDSM_T for B (MN-major).
-//   + 128-bit vectorized uint4 GMEM loads and stores.
-// - Stage 3 - Buffer Initialization & Register Fragments:
-//   + NUM_STPS_V = B_V / ROWS_PER_STP (1 step), NUM_STPS_K = D_K / ROWS_PER_STP (4 steps).
-//   + Register fragments allocated once at kernel entry.
-//   + Empty sequence handling (start_c >= end_c): write state_old or zero to final_states, then exit.
-// - Stage 4 - Chunk Recurrence (Epilogue directly into Accumulator):
-//   + Initialize SMEM sS (S_curr) with state_old (or zero).
-//   + Sequential loop over chunks c = start_c .. end_c - 1:
-//     - Load W_c from gW to sW, Y_c from gY_S to sY.
-//     - Write S_curr from sS into GMEM gY_S[:, c] along V slice.
-//     - Compute S_next = S_curr @ W_c + Y_c:
-//       * If first chunk and zero state: S_next = Y_c (bypass GEMM).
-//       * Otherwise: load Y_c into tCrC accumulator (FP32), execute cute::gemm accumulation,
-//         and write tCrC (converted to FP16) to sS.
-//     - On final chunk (c + 1 == end_c), write S_next to GMEM final_states[b, h].
-// -----------------------------------------------------------------------------------------
+// Chunk scan forward kernel: S_{c+1} = S_c @ W_c + Y_c.
 template <
     typename T,
     int NUM_THREADS,
@@ -80,9 +47,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_fwd(
     int64_t num_chunks,                        // scalar [int64]
     int64_t batch_size                         // scalar [int64]
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Setup & Grid Initialization
-    // -------------------------------------------------------------------------------------
     int batch_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
     int v_idx     = blockIdx.z; // V slice index: 0 .. (D_V / B_V - 1)
@@ -97,10 +62,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_fwd(
     int64_t slice_offset_v = (int64_t)v_idx * B_V * D_K;
     int64_t state_offset   = ((int64_t)batch_idx * gridDim.y + head_idx) * mat_elements_v + slice_offset_v;
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Shared Memory Allocation & CuTe Layouts
     // Compact 12 KB SMEM: sS (2 KB), sW (8 KB), sY (2 KB)
-    // -------------------------------------------------------------------------------------
     __shared__ alignas(16) T sS[B_V * D_K]; // 2 KB: current state S_curr for slice (16 x 64)
     __shared__ alignas(16) T sW[D_K * D_K]; // 8 KB: full chunk transition matrix W_c (64 x 64)
     __shared__ alignas(16) T sY[B_V * D_K]; // 2 KB: input update matrix Y_c for slice (16 x 64)
@@ -165,10 +128,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_fwd(
         clear(rStore[st]);
     }
 
-    // -------------------------------------------------------------------------------------
     // Zero-length sequence handling: start_c >= end_c
     // Write state_old (or zero) to final_states then exit
-    // -------------------------------------------------------------------------------------
     if (start_c >= end_c) {
         T* p_final = gFinalStates + state_offset;
         auto gFinal_chunk = make_tensor(make_gmem_ptr(p_final), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
@@ -194,9 +155,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_fwd(
         return;
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3: Initialize SMEM sS (S_curr) prior to the chunk loop
-    // -------------------------------------------------------------------------------------
     if (use_state_old && gStateOld != nullptr) {
         const T* p_state_old = gStateOld + state_offset;
         auto gStateOld_chunk = make_tensor(make_gmem_ptr(p_state_old), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
@@ -221,9 +180,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_fwd(
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------------------
     // Stage 4: Sequential Chunk Loop c = start_c .. end_c - 1
-    // -------------------------------------------------------------------------------------
     for (int32_t c = start_c; c < end_c; ++c) {
         int64_t w_offset = ((int64_t)head_idx * num_chunks + c) * mat_elements_k;
         int64_t y_offset = ((int64_t)head_idx * num_chunks + c) * mat_elements_v + slice_offset_v;
@@ -344,9 +301,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_fwd(
     }
 }
 
-// =========================================================================================
-// SECTION 2: HOST COORDINATION FUNCTION (chunk_scan_fwd)
-// =========================================================================================
+// HOST COORDINATION FUNCTION (chunk_scan_fwd)
 
 std::tuple<at::Tensor, at::Tensor>
 chunk_scan_fwd(
@@ -356,9 +311,7 @@ chunk_scan_fwd(
     const at::Tensor& cu_seq_lens,                 // (batch_size + 1,) [Int32 / Int64]
     int64_t chunk_size                             // scalar [int64] (default 64)
 ) {
-    // -------------------------------------------------------------------------------------
     // Stage 1 - Input Validation
-    // -------------------------------------------------------------------------------------
     TORCH_CHECK(W.is_cuda(), "W must be a CUDA tensor");
     const c10::cuda::CUDAGuard device_guard(W.device());
 
@@ -437,9 +390,7 @@ chunk_scan_fwd(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // -------------------------------------------------------------------------------------
     // Stage 2 - Kernel Launch
-    // -------------------------------------------------------------------------------------
     {
         using T = cutlass::half_t;
 
@@ -490,8 +441,6 @@ chunk_scan_fwd(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // -------------------------------------------------------------------------------------
     // Stage 3 - Return Results
-    // -------------------------------------------------------------------------------------
     return std::make_tuple(S, final_states);
 }

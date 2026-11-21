@@ -1057,6 +1057,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dq_dk_dv(
                     *reinterpret_cast<const uint4*>(&s_work_flat(local_row, col_base));
             }
         }
+        if (g + 1 < num_groups) {
+            __syncthreads(); // [SYNC 4] (WAR: finish reading dq_intra from Region 5 before g+1 writes dR^T)
+        }
     }
 
     // Stage 4 - Final Epilogue & GMEM Stores

@@ -1,299 +1,121 @@
-# DeltaNet v2: Fused Linear Attention CUDA Implementation for Turing GPUs
+# DeltaNet v2 (`deltanet_v2`)
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+High-performance **Variable-Length Gated DeltaNet v2** CUDA/CuTe library for **NVIDIA Turing (`SM75` — Tesla T4 / RTX 20-Series)**, featuring chunk-wise WY state updates, Grouped Query Attention (GQA), fast `L = 1` autoregressive decoding, native **PyTorch Autograd**, and **`torch.compile` (TorchInductor)** support.
+
+Based on NVIDIA's [**Gated DeltaNet v2** (arXiv:2605.22791)](https://arxiv.org/pdf/2605.22791), preserving the exact recurrence formulation while adding GQA and fused Turing kernels.
+
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-11.8%20%7C%2012.x-green.svg)](https://developer.nvidia.com/cuda-toolkit)
+[![CUDA](https://img.shields.io/badge/CUDA-11.8%20%7C%2012.x%20%7C%2013.0-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![GPU](https://img.shields.io/badge/Target%20GPU-Turing%20SM75%20(Tesla%20T4%20%2F%20RTX%2020--Series)-orange.svg)](https://developer.nvidia.com/cuda-gpus)
 
-**DeltaNet v2** is a fast, hardware-optimized CUDA implementation of the linear attention mechanism with recurrent chunk-wise state updates (chunk WY representation) and Grouped Query Attention (GQA).
+---
 
-This project is based on NVIDIA's paper [**Gated DeltaNet v2** (arXiv:2605.22791)](https://arxiv.org/pdf/2605.22791), keeping the core recurrence architecture faithful to the original paper while incorporating Grouped Query Attention (GQA) for efficient scaling.
+## Motivation
+
+This project is built to help **students, researchers, and developers** train and deploy linear-attention models efficiently on accessible **Turing (`SM75`)** GPUs such as **Google Colab / Kaggle Tesla T4** and **RTX 20-series** cards:
+
+- **Tailored for Turing `SM75`:** Most open-source linear-attention kernels target Ampere/Hopper (`SM80+`) and hit register/shared-memory limits on `SM75`. DeltaNet v2 is tuned directly for Turing tensor cores and memory hierarchy.
+- **Fused Chunk-WY & Decode Pipelines:** Fuses intra-chunk attention, inter-chunk state scan, and single-step (`L = 1`) decode into compact on-chip kernels to cut global memory round-trips and peak activation VRAM.
+- **`torch.compile` & 1-Command Setup:** Registers `FakeTensor` metadata with the PyTorch Dispatcher for seamless `torch.compile` integration, with pre-built `.whl` distribution support.
 
 ---
 
-## 🎯 Motivation
+## Benchmarks (NVIDIA Tesla T4 — `SM75`)
 
-Most existing open-source implementations of DeltaNet v2 and related linear attention variants focus almost exclusively on deep optimizations for high-end enterprise GPUs such as **NVIDIA A100 and H100+**. 
+> **Hardware Scope:** All measurements below were collected on an **NVIDIA Tesla T4 (16 GB VRAM, `SM75`)** using FP16 (`torch.float16`). Other GPU architectures (Ampere, Ada, Hopper) have not been evaluated.
 
-However, free and accessible cloud environments like **Google Colab and Kaggle** predominantly offer **NVIDIA Tesla T4** GPUs (Turing SM75), and many students, independent researchers, and developers work on consumer **RTX 20-series / 20 Super** hardware. 
+### 1. End-to-End `DeltaBlock` with `torch.compile`
 
-This repository was created specifically to bridge that gap:
-- **Tailored for Turing SM75**: Specifically engineered and tuned for the compute and shared memory constraints of Tesla T4 and RTX 20-series GPUs.
-- **Accessible Experimentation**: Allows anyone to train, experiment with, and evaluate linear attention models on free Colab/Kaggle instances or accessible consumer cards without needing an A100 cluster.
-- **Fused Kernel Pipelines**: Fuses multi-pass recurrences, normalizations, and epilogues into compact on-chip kernels to minimize global memory round-trips.
-
----
-
-## ⚡ Highlights
-
-> **Hardware Evaluation Scope**: All benchmark and profiling results presented in this repository were evaluated strictly on an **NVIDIA Tesla T4 GPU (Turing SM75)**. Other GPU architectures (such as Ampere, Ada Lovelace, or Hopper) have not yet been evaluated.
-
-- **Outperforming Open-Source Baselines**:
-  - **~1.9x faster autoregressive decode** compared to official **NVLabs GatedDeltaNet-2** (1,229,778 tokens/s vs 652,358 tokens/s at $B = 2048$).
-  - **~2.75x faster training pass (forward + backward)** compared to **NVLabs GatedDeltaNet-2** (22.96 ms vs 63.25 ms per step at $L = 4096$).
-  - **~3.6x faster training pass (forward + backward)** compared to **Flash Linear Attention (FLA v1)** (22.96 ms vs 82.57 ms per step at $L = 4096$).
-- **Speedup vs Unfused PyTorch Reference**:
-  - **Up to 7.75x faster inference** single-step decode throughput vs un-fused PyTorch autograd baseline (1,229,778 vs 158,688 tokens/s).
-  - **Up to 5.02x faster training pass** vs un-fused PyTorch autograd baseline (22.96 ms vs 115.32 ms at $L = 4096$).
-- **2.0x Higher Batch Capacity**: Reduces peak activation and intermediate memory footprint, doubling max batch size before OOM.
-- **`torch.compile` Ready**: Built-in PyTorch Dispatcher integration with fake tensor registrations for seamless `torch.compile` compatibility.
-- **1-Command Setup**: Self-contained installation on Google Colab, Kaggle, and local GPU machines without external dependencies.
-
----
-
-## 📊 Benchmark Results
-
-All benchmarks were evaluated on an **NVIDIA Tesla T4 GPU (16 GB VRAM, SM75)** using **PyTorch 2.x** *(evaluated exclusively on Tesla T4; other GPU architectures have not been assessed)*:
-
----
-
-### Benchmark Suite 1: Full Layer with `torch.compile` (End-to-End Module)
-
-> **Scope Note**: This benchmark evaluates the **complete end-to-end token-mixer block**, including all companion layers: input linear projections ($X \to q, k, v, b, w, \alpha, \gamma$), RMSNorm, gating network, output projection, and MLP / FFW.
-
-#### 1. Autoregressive Inference (Single Decode Step, $L = 1$)
-Evaluating generation throughput and latency across varying batch sizes ($d_{\text{model}} = 768$, $H_q = 8$, $H_{kv} = 4$, $d_k = 64$, $d_v = 64$):
-
-| Batch Size | Mode | Latency (ms) | Throughput (tok/s) | Peak VRAM (GB) | Speedup vs Torch Eager |
-|:---:|:---|:---:|:---:|:---:|:---:|
-| **16** | torch-eager | 10.55 | 1,516 | 0.33 | 1.00x |
-| 16 | torch-compiled | 3.63 | 4,405 | 0.32 | 2.90x |
-| 16 | **kernel-compiled** | **3.36** | **4,769** | **0.32** | **3.14x** |
-| **64** | torch-eager | 9.94 | 6,438 | 0.42 | 1.00x |
-| 64 | torch-compiled | 4.83 | 13,258 | 0.38 | 2.06x |
-| 64 | **kernel-compiled** | **3.27** | **19,570** | **0.36** | **3.04x** |
-| **256** | torch-eager | 29.45 | 8,693 | 0.81 | 1.00x |
-| 256 | torch-compiled | 14.29 | 17,917 | 0.62 | 2.06x |
-| 256 | **kernel-compiled** | **7.08** | **36,184** | **0.56** | **4.16x** |
-| **1024** | torch-eager | 113.56 | 9,017 | 2.34 | 1.00x |
-| 1024 | torch-compiled | 58.30 | 17,565 | 1.59 | 1.95x |
-| 1024 | **kernel-eager** | **26.11** | **39,215** | **1.36** | **4.35x** |
-| 1024 | **kernel-compiled** | **24.65** | **41,544** | **1.36** | **4.61x** |
-
-#### Maximum Batch Size & Peak Throughput (Decode)
-| Mode | Max Batch Size (before OOM) | Peak Throughput (tok/s) | Time for 256 tokens (s) |
-|:---|:---:|:---:|:---:|
-| torch-eager | 6,656 | 9,152 | 186.2s |
-| torch-compiled | 10,752 | 19,570 | 140.6s |
-| kernel-eager | 12,288 | 40,706 | 77.3s |
-| **kernel-compiled** | **13,312 (2.0x capacity)** | **42,258 (4.62x speedup)** | **80.6s** |
-
-#### 2. Training (Forward + Backward Pass, $L = 1024$)
-| Batch Size | Mode | Step Time (ms) | Training Throughput (tok/s) | Saved Activations VRAM |
-|:---:|:---|:---:|:---:|:---:|
-| **4** | torch-eager | 411.2 | 9,961 | 4.46 GB |
-| 4 | torch-compiled | 209.0 | 19,600 | 2.36 GB |
-| 4 | **kernel-compiled** | **194.3** | **21,083** | **1.62 GB** (2.76x less) |
-| **8** | torch-eager | 776.0 | 10,555 | 8.71 GB |
-| 8 | torch-compiled | 363.0 | 22,596 | 4.53 GB |
-| 8 | **kernel-compiled** | **345.0** | **23,765** | **3.02 GB** (2.88x less) |
-| **16** | torch-eager | *OOM* | - | - |
-| 16 | torch-compiled | 706.0 | 23,198 | 8.86 GB |
-| 16 | **kernel-compiled** | **619.0** | **26,459** | **5.85 GB** |
+Evaluates the **complete token-mixer block** (`W_proj` projections, DeltaNet recurrence, RMSNorm, gating, `W_out`, and MLP/FFW) with $d_{\text{model}} = 768$, $H_q = 8$, $H_{kv} = 4$, $d_k = d_v = 64$.
 
 ![End-to-End Benchmark with torch.compile](assets/benchmark_compiled_e2e.png)
 
+#### Autoregressive Decode (`L = 1`)
+
+| Batch Size | Torch Eager (ms / tok/s) | Torch Compiled (ms / tok/s) | Kernel Compiled (ms / tok/s) | Peak VRAM (Base / Ours) | Speedup vs Eager |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **16** | 10.55 / 1,516 | 3.63 / 4,405 | **3.36 / 4,769** | 0.33 / 0.32 GB | **3.14x** |
+| **64** | 9.94 / 6,438 | 4.83 / 13,258 | **3.27 / 19,570** | 0.42 / 0.36 GB | **3.04x** |
+| **256** | 29.45 / 8,693 | 14.29 / 17,917 | **7.08 / 36,184** | 0.81 / 0.56 GB | **4.16x** |
+| **1024** | 113.56 / 9,017 | 58.30 / 17,565 | **24.65 / 41,544** | 2.34 / 1.36 GB | **4.61x** |
+
+*Max Decode Capacity before OOM:* **13,312** (`kernel-compiled`, **42,258 tok/s**) vs **10,752** (`torch-compiled`, 19,570 tok/s) vs **6,656** (`torch-eager`, 9,152 tok/s) — **2.0x batch capacity** and **4.62x peak throughput**.
+
+#### Training (`Fwd + Bwd`, `L = 1024`)
+
+| Batch Size | Torch Eager | Torch Compiled | Kernel Compiled | Saved Activations (Comp / Ours) |
+| :---: | :---: | :---: | :---: | :---: |
+| **4** | 411.2 ms (9,961 tok/s) | 209.0 ms (19,600 tok/s) | **194.3 ms (21,083 tok/s)** | 2.36 / **1.62 GB** |
+| **8** | 776.0 ms (10,555 tok/s) | 363.0 ms (22,596 tok/s) | **345.0 ms (23,765 tok/s)** | 4.53 / **3.02 GB** |
+| **16** | *OOM* | 706.0 ms (23,198 tok/s) | **619.0 ms (26,459 tok/s)** | 8.86 / **5.85 GB** |
+
 ---
 
-### Benchmark Suite 2: Pure Gated DeltaNet Token Mixer (vs Open-Source Baselines)
+### 2. Pure Token Mixer vs Open-Source Baselines
 
-> **Scope Note**: This benchmark isolates and evaluates **strictly the recurrence token mixer kernels without companion layers (excluding MLP, SWA, and FFW)** to benchmark kernel compute performance fairly against open-source baselines:
-> - **PyTorch Reference**: Pure un-fused PyTorch autograd baseline
-> - **FLA GatedDeltaNet (v1)**: Flash Linear Attention chunkwise parallel implementation
-> - **FLA GatedDeltaNet-2**: Flash Linear Attention v2 recurrence implementation
-> - **NVLabs GatedDeltaNet-2**: NVIDIA Official Gated DeltaNet-2 recurrence implementation
-
-#### 1. Autoregressive Inference (Single Decode Step, $L = 1$)
-Evaluated across batch sizes $B \in [1, 16, 64, 256, 1024, 2048]$ ($d_{\text{model}} = 768$, $H_q = 8$, $H_{kv} = 8$, $d_k = 64$, $d_v = 64$):
-
-| Batch Size (B) | Method / Implementation | Latency (ms) | Throughput (tok/s) | Peak VRAM (MB) | Speedup vs PyTorch |
-|:---:|:---|:---:|:---:|:---:|:---:|
-| **1** | PyTorch Reference (Unfused) | 0.980 | 1,020 | 27.4 | 1.00x |
-| 1 | FLA GatedDeltaNet (v1) | 1.139 | 878 | 27.1 | 0.86x |
-| 1 | FLA GatedDeltaNet-2 | 2.252 | 444 | 27.3 | 0.44x |
-| 1 | NVLabs GatedDeltaNet-2 | 1.282 | 780 | 27.4 | 0.76x |
-| 1 | **DeltaNet v2 (Ours)** | **0.281** | **3,557** | **27.3** | **3.49x** |
-| **16** | PyTorch Reference (Unfused) | 1.756 | 9,111 | 36.9 | 1.00x |
-| 16 | FLA GatedDeltaNet (v1) | 0.905 | 17,675 | 32.1 | 1.94x |
-| 16 | FLA GatedDeltaNet-2 | 1.337 | 11,967 | 34.1 | 1.31x |
-| 16 | NVLabs GatedDeltaNet-2 | 1.298 | 12,324 | 36.1 | 1.35x |
-| 16 | **DeltaNet v2 (Ours)** | **0.598** | **26,760** | **34.0** | **2.94x** |
-| **64** | PyTorch Reference (Unfused) | 1.361 | 47,027 | 71.2 | 1.00x |
-| 64 | FLA GatedDeltaNet (v1) | 0.962 | 66,517 | 51.2 | 1.41x |
-| 64 | FLA GatedDeltaNet-2 | 2.003 | 31,950 | 57.4 | 0.68x |
-| 64 | NVLabs GatedDeltaNet-2 | 1.584 | 40,406 | 63.5 | 0.86x |
-| 64 | **DeltaNet v2 (Ours)** | **0.414** | **154,628** | **59.3** | **3.29x** |
-| **256** | PyTorch Reference (Unfused) | 2.207 | 116,011 | 208.5 | 1.00x |
-| 256 | FLA GatedDeltaNet (v1) | 0.924 | 276,984 | 127.6 | 2.39x |
-| 256 | FLA GatedDeltaNet-2 | 1.371 | 186,721 | 150.9 | 1.61x |
-| 256 | NVLabs GatedDeltaNet-2 | 1.465 | 174,755 | 172.9 | 1.51x |
-| 256 | **DeltaNet v2 (Ours)** | **0.437** | **585,870** | **156.4** | **5.05x** |
-| **1024** | PyTorch Reference (Unfused) | 7.498 | 136,563 | 757.8 | 1.00x |
-| 1024 | FLA GatedDeltaNet (v1) | 1.572 | 651,352 | 433.2 | 4.77x |
-| 1024 | FLA GatedDeltaNet-2 | 1.752 | 584,317 | 525.2 | 4.28x |
-| 1024 | NVLabs GatedDeltaNet-2 | 1.751 | 584,885 | 610.7 | 4.28x |
-| 1024 | **DeltaNet v2 (Ours)** | **0.975** | **1,050,217** | **544.7** | **7.69x** |
-| **2048** | PyTorch Reference (Unfused) | 12.906 | 158,688 | 1490.1 | 1.00x |
-| 2048 | FLA GatedDeltaNet (v1) | 2.872 | 713,035 | 840.6 | 4.49x |
-| 2048 | FLA GatedDeltaNet-2 | 3.138 | 652,713 | 1024.4 | 4.11x |
-| 2048 | NVLabs GatedDeltaNet-2 | 3.139 | 652,358 | 1194.5 | 4.11x |
-| 2048 | **DeltaNet v2 (Ours)** | **1.665** | **1,229,778** | **1062.4** | **7.75x** |
-
-#### 2. Training Pass (Forward + Backward Step)
-Evaluated across sequence lengths $L \in [512, 1024, 2048, 4096]$ with batch size $B = 4$ ($d_{\text{model}} = 768$, $H_q = 8$, $H_{kv} = 8$, $d_k = 64$, $d_v = 64$):
-
-| SeqLen (L) | Tokens (B*L) | Method / Implementation | Fwd (ms) | Fwd+Bwd (ms) | Peak VRAM (MB) | Speedup vs PyTorch |
-|:---:|:---:|:---|:---:|:---:|:---:|:---:|
-| **512** | 2,048 | PyTorch Reference (Unfused) | 3.35 | 9.89 | 166.7 | 1.00x |
-| 512 | 2,048 | FLA GatedDeltaNet (v1) | 5.08 | 11.65 | 95.4 | 0.85x |
-| 512 | 2,048 | FLA GatedDeltaNet-2 | 2.46 | 8.27 | 157.5 | 1.20x |
-| 512 | 2,048 | NVLabs GatedDeltaNet-2 | 2.51 | 8.36 | 164.3 | 1.18x |
-| 512 | 2,048 | **DeltaNet v2 (Ours)** | **1.28** | **3.63** | **104.3** | **2.72x** |
-| **1024** | 4,096 | PyTorch Reference (Unfused) | 4.74 | 17.97 | 309.8 | 1.00x |
-| 1024 | 4,096 | FLA GatedDeltaNet (v1) | 9.26 | 20.95 | 153.4 | 0.86x |
-| 1024 | 4,096 | FLA GatedDeltaNet-2 | 3.10 | 15.96 | 271.6 | 1.13x |
-| 1024 | 4,096 | NVLabs GatedDeltaNet-2 | 3.13 | 15.97 | 275.6 | 1.13x |
-| 1024 | 4,096 | **DeltaNet v2 (Ours)** | **1.62** | **5.53** | **154.6** | **3.25x** |
-| **2048** | 8,192 | PyTorch Reference (Unfused) | 8.19 | 40.68 | 567.7 | 1.00x |
-| 2048 | 8,192 | FLA GatedDeltaNet (v1) | 18.30 | 41.53 | 254.3 | 0.98x |
-| 2048 | 8,192 | FLA GatedDeltaNet-2 | 6.79 | 31.73 | 492.2 | 1.28x |
-| 2048 | 8,192 | NVLabs GatedDeltaNet-2 | 6.71 | 31.81 | 500.2 | 1.28x |
-| 2048 | 8,192 | **DeltaNet v2 (Ours)** | **2.99** | **11.05** | **255.8** | **3.68x** |
-| **4096** | 16,384 | PyTorch Reference (Unfused) | 16.77 | 115.32 | 1084.9 | 1.00x |
-| 4096 | 16,384 | FLA GatedDeltaNet (v1) | 36.26 | 82.57 | 455.3 | 1.40x |
-| 4096 | 16,384 | FLA GatedDeltaNet-2 | 14.15 | 63.31 | 933.7 | 1.82x |
-| 4096 | 16,384 | NVLabs GatedDeltaNet-2 | 14.23 | 63.25 | 949.7 | 1.82x |
-| 4096 | 16,384 | **DeltaNet v2 (Ours)** | **6.59** | **22.96** | **459.6** | **5.02x** |
+Isolates the **recurrence token-mixer kernel** ($d_{\text{model}} = 768$, $H_q = 8$, $H_{kv} = 8$, $d_k = d_v = 64$) against **PyTorch Reference (Unfused)**, **FLA GatedDeltaNet (v1)**, **FLA GatedDeltaNet-2**, and **NVLabs GatedDeltaNet-2**.
 
 ![Open-Source Baselines Benchmark Comparison](assets/benchmark_opensource_baselines.png)
 
----
+#### Autoregressive Decode (`L = 1`, Latency ms / Throughput tok/s)
 
-### Hardware Profiling & Low-Level Kernel Analysis (NVIDIA Nsight Compute)
+| Batch | PyTorch Eager | FLA v1 | FLA v2 | NVLabs v2 | DeltaNet v2 (Ours) | Speedup (vs PyTorch / NVLabs) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | 0.980 / 1,020 | 1.139 / 878 | 2.252 / 444 | 1.282 / 780 | **0.281 / 3,557** | **3.49x / 4.56x** |
+| **16** | 1.756 / 9,111 | 0.905 / 17,675 | 1.337 / 11,967 | 1.298 / 12,324 | **0.598 / 26,760** | **2.94x / 2.17x** |
+| **64** | 1.361 / 47,027 | 0.962 / 66,517 | 2.003 / 31,950 | 1.584 / 40,406 | **0.414 / 154,628** | **3.29x / 3.83x** |
+| **256** | 2.207 / 116,011 | 0.924 / 276,984 | 1.371 / 186,721 | 1.465 / 174,755 | **0.437 / 585,870** | **5.05x / 3.35x** |
+| **1024** | 7.498 / 136,563 | 1.572 / 651,352 | 1.752 / 584,317 | 1.751 / 584,885 | **0.975 / 1,050,217** | **7.69x / 1.80x** |
+| **2048** | 12.906 / 158,688 | 2.872 / 713,035 | 3.138 / 652,713 | 3.139 / 652,358 | **1.665 / 1,229,778** | **7.75x / 1.89x** |
 
-The following profile captures low-level kernel execution on an **NVIDIA Tesla T4 (Turing SM75)** using the **NVIDIA Nsight Compute (NCU)** CLI profiler:
+#### Training Pass (`Fwd + Bwd`, `B = 4`, ms)
 
-![NVIDIA Nsight Compute Kernel Summary](assets/ncu_kernel_summary.png)
-
-#### Profiling Environment & Workload Configuration
-- **Hardware**: NVIDIA Tesla T4 (Turing Architecture, SM75, Compute Capability 7.5, 16 GB VRAM, Driver 580.82.07).
-- **Profiler Version**: NVIDIA Nsight Compute Command Line Profiler Version 2026.3.1.0 (build 38829034).
-- **Workload Shapes**:
-  - **Training Step (Forward + Backward)**: $B = 4$, $L = 1024$ (4,096 tokens total, variable-length packed with cumulative sequence offsets `cu_seqlens = [0, 1024, 2048, 3072, 4096]`), $H_q = 8$, $H_{kv} = 4$, $d_k = 64$, $d_v = 64$, $\text{chunk} = 64$, $d_{\text{model}} = 768$.
-  - **Inference Step (Autoregressive Decode)**: $B = 128$, $L = 1$, $H_q = 8$, $H_{kv} = 4$, $d_k = 64$, $d_v = 64$, $d_{\text{model}} = 768$.
-- **Precision**: FP16 (`torch.float16`).
-- **Clock Frequency Note**: Nsight Compute fixes GPU core and memory clocks to deterministic base frequencies during profiling to ensure reproducible performance counter sampling; consequently, absolute kernel durations recorded by `ncu` differ from dynamic-clock wall-clock benchmarks.
-- **Profiler Heuristic Note**: The `Estimated Speedup [%]` and `Runtime Improvement` columns provided in the Nsight Compute GUI are heuristic rule-based recommendations generated by the NCU rules engine rather than empirical measurements, and are omitted from this table.
-
-#### Kernel Execution Breakdown
-
-| Kernel Name | Phase | Duration (μs) | % Time | Compute Throughput (%) | Memory Throughput (%) | Registers / Thread |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| `kernel_chunk_wy_fwd` | fwd | 325.18 | 10.66% | 49.11% | 42.30% | 139 |
-| `kernel_chunk_scan_fwd` | fwd | 140.29 | 4.60% | 32.83% | 77.26% | 67 |
-| `kernel_output_combine_fwd` | fwd | 290.43 | 9.52% | 35.11% | 48.91% | 180 |
-| `kernel_output_combine_dc_inter_dS` | bwd | 199.74 | 6.55% | 40.42% | 68.90% | 244 |
-| `kernel_output_combine_dc_total` | bwd | 44.99 | 1.47% | 50.87% | 69.98% | 60 |
-| `kernel_chunk_scan_bwd` | bwd | 161.44 | 5.29% | 29.25% | 71.12% | 79 |
-| `kernel_chunk_wy_bwd` | bwd | 988.61 | 32.41% | 30.55% | 29.46% | 206 |
-| `kernel_output_combine_dq_dk_dv` | bwd | 726.46 | 23.81% | 21.91% | 28.63% | 231 |
-| `kernel_deltanet_infer` | decode | 173.57 | 5.69% | 73.33% | 68.67% | 64 |
-| **Total** | - | **3,050.72** | **100.00%** | - | - | - |
-
-#### Measured Observations
-1. **Backward Pass Execution Share**:
-   - Backward kernels account for **69.53%** (~70%) of total profiled kernel execution time ($2,121.24\ \mu\text{s}$ out of $3,050.72\ \mu\text{s}$).
-   - The two heaviest backward kernels—`kernel_chunk_wy_bwd` ($988.61\ \mu\text{s}$, $32.41\%$) and `kernel_output_combine_dq_dk_dv` ($726.46\ \mu\text{s}$, $23.81\%$)—together account for **56.22%** (~56%) of total kernel time.
-2. **Register Allocation and SM Occupancy**:
-   - The heavy backward kernels allocate **206–244 registers per thread** (`kernel_chunk_wy_bwd`: 206 registers, `kernel_output_combine_dq_dk_dv`: 231 registers, `kernel_output_combine_dc_inter_dS`: 244 registers).
-   - This register pressure limits thread block residency to **2 blocks per SM** (`launch__occupancy_limit_registers = 2`), resulting in a theoretical occupancy of 25.00% (achieved occupancy: 12.65%–24.77%).
-3. **Latency-Limited Execution**:
-   - The two heaviest backward kernels exhibit compute throughput of **21.91%–30.55%** and memory throughput of **28.63%–29.46%**.
-   - Profiler warp state statistics show that execution is latency-limited, with primary stall reasons being dependency wait (`smsp__average_warps_issue_stalled_wait_per_issue_active.ratio`: 1.77–1.86) and no instruction issued (`smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio`: up to 2.29 in `kernel_chunk_wy_bwd`).
-4. **Decode Kernel Saturation**:
-   - In contrast, the single-step inference kernel (`kernel_deltanet_infer`) operates near hardware saturation, achieving **73.33% compute throughput** and **68.67% memory throughput** with 64 registers per thread.
-
-#### Limitations and Future Work
-- **Ablation Limitations**: There is currently no isolated ablation study evaluating the net trade-off between kernel fusion benefits and the reduced SM occupancy caused by high register pressure.
-- **Optimization Next Steps**:
-  - **Epilogue and Code Size Reduction**: Refactoring fused epilogues and unrolled loops to decrease static code size and reduce register allocation.
-  - **Instruction-Level Parallelism (ILP)**: Interleaving independent compute instructions and memory operations within recurrent loops to mitigate dependency wait stalls.
-  - **Register Clamping Evaluation**: Benchmarking explicit register limits via `__launch_bounds__` or `-maxrregcount` compiler flags to determine whether increased SM occupancy outweighs potential register spilling on Turing SM75 hardware.
+| SeqLen | Tokens | PyTorch Eager | FLA v1 | FLA v2 | NVLabs v2 | DeltaNet v2 (Ours) | Peak VRAM (Ours / NVLabs) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **512** | 2,048 | 9.89 | 11.65 | 8.27 | 8.36 | **3.63** (**2.30x** vs NVLabs) | **104.3** / 164.3 MB |
+| **1024** | 4,096 | 17.97 | 20.95 | 15.96 | 15.97 | **5.53** (**2.89x** vs NVLabs) | **154.6** / 275.6 MB |
+| **2048** | 8,192 | 40.68 | 41.53 | 31.73 | 31.81 | **11.05** (**2.88x** vs NVLabs) | **255.8** / 500.2 MB |
+| **4096** | 16,384 | 115.32 | 82.57 | 63.31 | 63.25 | **22.96** (**2.75x** vs NVLabs) | **459.6** / 949.7 MB |
 
 ---
 
-## 📋 Requirements & Supported GPUs
+## Installation
 
-### 1. Supported GPUs (Turing SM75 with Tensor Cores)
-The CUDA kernels are specifically engineered for **NVIDIA Turing SM75** hardware:
-- **Cloud & Free-tier Environments**:
-  - **NVIDIA Tesla T4** (Default free GPU tier on **Google Colab** and **Kaggle**)
-- **Consumer Desktops & Laptops (GeForce RTX 20 Series)**:
-  - GeForce RTX 2080 Ti
-  - GeForce RTX 2080 Super / RTX 2080
-  - GeForce RTX 2070 Super / RTX 2070
-  - GeForce RTX 2060 Super / RTX 2060
-  - GeForce RTX 20-Series Mobile / Max-Q GPUs
-- **Professional & Workstation GPUs**:
-  - Quadro RTX 4000, Quadro RTX 5000, Quadro RTX 6000, Quadro RTX 8000
-- *Forward Compatibility*: Embedded `compute_75` PTX allows the binaries to be JIT-executed on newer GPUs (Ampere SM80/SM86, Ada SM89, Hopper SM90).
+### Requirements
+- **GPU:** NVIDIA Turing (`SM75`: Tesla T4, RTX 2060/2070/2080, Quadro RTX). Embedded `compute_75` PTX also supports JIT execution on Ampere/Ada/Hopper.
+- **OS & Python:** Linux `x86_64`, **Python 3.13**, **PyTorch >= 2.0**, **CUDA Toolkit >= 11.8 / 12.x / 13.0**, `g++ >= 10` (C++20 with automatic C++17 fallback).
+- **CUTLASS / CuTe:** Managed as a submodule in `third_party/cutlass` (`>= 4.x`, `<cute/tensor.hpp>`).
 
-### 2. Software Requirements (Before Compilation)
-Before building and compiling the extension, ensure your system provides:
-- **Operating System**: Linux x86_64 (Ubuntu 20.04/22.04+, Debian, CentOS/RHEL)
-- **Supported Python Version**: **Python 3.13** only (tested on Linux x86_64 with PyTorch 2.6+ / 2.14+, CUDA 12.x / 13.0). Other versions (including Python 3.8–3.12) are not supported.
-- **PyTorch**: `>= 2.0.0` with CUDA support (tested on PyTorch 2.4, 2.6+, 2.14+ with CUDA 12.x / 13.0)
-- **CUDA Toolkit**: `>= 11.8` or `12.x` / `13.x` (with `nvcc` compiler installed and accessible in `$PATH`)
-- **C++ Host Compiler**: `gcc` / `g++ >= 10.0` supporting **C++20** (`-std=c++20`), with automatic fallback to **C++17** (`-std=c++17`)
-- **NVIDIA CUTLASS / CuTe**:
-  - Requires **CUTLASS >= 3.0** (specifically the header-only `<cute/tensor.hpp>`).
-  - Managed as a Git submodule in `third_party/cutlass`.
-  - When cloning this repository, initialize submodules recursively:
-    ```bash
-    git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
-    # Or if cloned without --recursive:
-    git submodule update --init --recursive third_party/cutlass
-    ```
-
----
-
-## 🚀 Quick Start
-
-### 1. Installation
-
-#### Option A: Install Prebuilt Wheel from GitHub Releases (Recommended for Linux x86_64)
-
-Standalone pre-compiled `.whl` distributions are hosted on [GitHub Releases](https://github.com/CBG6682/Varlen-Gated-DeltaNet/releases/latest).
-
-| Wheel Package | Supported Environment Tuple (Python / PyTorch / CUDA / Arch) | SHA-256 Checksum |
-|:---|:---|:---|
-| [`deltanet_v2-2.0.0-py3-none-any.whl`](https://github.com/CBG6682/Varlen-Gated-DeltaNet/releases/download/v2.0.0/deltanet_v2-2.0.0-py3-none-any.whl) | Python 3.13, PyTorch 2.6+ / 2.14+, CUDA 12.x / 13.0, Linux x86_64 (SM75) | `5fa69c4364c78fe6be5a3a51bfe60a16afea4ac7b70f549b91057e48aedfc381` |
+### Option 1: Install Pre-built Wheel (Fastest)
 
 ```bash
-# Direct installation from GitHub Releases
+pip install wheels/deltanet_v2-2.0.0-py3-none-any.whl
+# Or directly from GitHub Releases:
 pip install https://github.com/CBG6682/Varlen-Gated-DeltaNet/releases/download/v2.0.0/deltanet_v2-2.0.0-py3-none-any.whl
 ```
 
-#### Option B: Standard Installation from Source (via Git Submodule):
+### Option 2: Build from Source
+
 ```bash
 git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git
 cd Varlen-Gated-DeltaNet
 git submodule update --init --recursive third_party/cutlass
-pip install ninja setuptools wheel einops
+pip install -r requirements.txt
 MAX_JOBS=2 pip install . --no-build-isolation
 ```
 
 ---
 
-### 2. Usage Example
+## Quick Start
+
+### 1. Packed Varlen Training + `torch.compile`
 
 ```python
 import torch
 from deltanet_v2 import DeltaBlock
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# 1. Initialize DeltaBlock with independent key/value gating
+device = "cuda"
 model = DeltaBlock(
     d_model=768,
     num_q_heads=8,
@@ -304,132 +126,68 @@ model = DeltaBlock(
     hidden_dim=768 * 4,
 ).to(device=device, dtype=torch.float16)
 
-# -------------------------------------------------------------
-# Training (Variable-length Packed Sequences)
-# -------------------------------------------------------------
-model.train()
+compiled_model = torch.compile(model, backend="inductor")
 
-# 2 sequences of lengths [512, 1024] packed into total_L = 1536 tokens
-total_L = 1536
-x = torch.randn(total_L, 768, device=device, dtype=torch.float16, requires_grad=True)
+# Packed batch of 2 sequences: lengths [512, 1024] -> total_L = 1536
+x = torch.randn(1536, 768, device=device, dtype=torch.float16, requires_grad=True)
 cu_seqlens = torch.tensor([0, 512, 1536], dtype=torch.int32, device=device)
 
-# Forward pass using fused CUDA kernel
-out, final_states = model(x, cu_seqlens=cu_seqlens, use_kernel=True)
+out, final_states = compiled_model(x, cu_seqlens=cu_seqlens, use_kernel=True)
+out.sum().backward()
+```
 
-# Backward pass
-loss = out.sum()
-loss.backward()
-print("Grad x shape:", x.grad.shape)  # torch.Size([1536, 768])
+### 2. Autoregressive Decode (`L = 1`)
 
-# -------------------------------------------------------------
-# Autoregressive Token Generation (L = 1 decode step)
-# -------------------------------------------------------------
+```python
 model.eval()
-
 batch_size = 64
 next_token = torch.randn(batch_size, 1, 768, device=device, dtype=torch.float16)
-
-# Initialize recurrent state: (B, num_kv_heads, d_v, d_k)
 past_states = torch.zeros(batch_size, 4, 64, 64, device=device, dtype=torch.float16)
 
 with torch.no_grad():
     y, past_states = model(next_token, past_states=past_states, use_kernel=True)
-
-print("Decoded token shape:", y.shape)            # torch.Size([64, 1, 768])
-print("Updated state shape:", past_states.shape)  # torch.Size([64, 4, 64, 64])
 ```
 
 ---
 
-### 3. Accelerated with `torch.compile`
-
-DeltaNet v2 kernels register fake/meta tensors with the PyTorch Dispatcher, enabling full graph capture under `torch.compile`:
-
-```python
-compiled_model = torch.compile(model)
-out, states = compiled_model(x, cu_seqlens=cu_seqlens, use_kernel=True)
-```
-
----
-
-## 🔬 Running Benchmarks in Google Colab
-
-Open [`demo.ipynb`](file:///demo.ipynb) in Google Colab (with automatic C++20 build and C++17 fallback) or run directly in bash:
+## Running Tests & Benchmarks
 
 ```bash
-# 1. Clone repository with CUTLASS submodule to /content/Deltanet
-git clone --recursive https://github.com/CBG6682/Varlen-Gated-DeltaNet.git /content/Deltanet
-cd /content/Deltanet
+# 1. Numerical correctness (Varlen Fwd/Bwd, Decode L=1, E2E Handoff, CUDAGraph, torch.compile)
+python tests/test_correctness.py
+python tests/test_correctness.py --quick   # Fast smoke run
 
-# 2. Ensure third_party/cutlass submodule is initialized
-git submodule update --init --recursive third_party/cutlass
+# 2. Autoregressive decode benchmark (L = 1)
+python -u tests/bench_inference.py --dim 768 --batches 1,16,64,256,1024,2048 --warmup 5 --iters 20
 
-# 3. Fast install via prebuilt wheel or build from source
-pip install ninja setuptools wheel einops
-pip install wheels/*.whl || MAX_JOBS=2 pip install . --no-build-isolation
+# 3. Training pass benchmark (Fwd + Bwd)
+python -u tests/bench_training.py --dim 768 --batch-size 4 --seq-lens 512,1024,2048,4096 --warmup 3 --iters 10
+```
 
-# 4. Install baselines with pinned commit hashes
-pip install git+https://github.com/sustcsonglin/flash-linear-attention.git@2705ab8ee9a9086bcfa6d079858e4281e01215a1 --no-build-isolation
-git clone https://github.com/NVlabs/GatedDeltaNet-2.git /content/gateddeltanet-2
-cd /content/gateddeltanet-2 && git checkout de8476de0fecae08fc16f0bf3154900244c61c73 && cd /content/Deltanet
-echo "# Standalone" > /content/gateddeltanet-2/lit_gpt/__init__.py
+For interactive Colab/Kaggle execution and full end-to-end / profiling workflows, see [demo.ipynb](demo.ipynb) and [benchmark/deltanet.ipynb](benchmark/deltanet.ipynb).
 
-# 5. Numerical Correctness Sanity Test (Kernel Varlen vs PyTorch Varlen Reference)
-python /content/Deltanet/tests/test_correctness.py
+---
 
-# 6. Benchmark Single-Step Autoregressive Inference (L = 1)
-python -u /content/Deltanet/tests/bench_inference.py --dim 768 --batches 1,16,64,256,1024,2048 --warmup 5 --iters 20
+## Project Structure
 
-# 7. Benchmark Training Pass (Forward + Backward)
-python -u /content/Deltanet/tests/bench_training.py --dim 768 --batch-size 4 --seq-lens 512,1024,2048,4096 --warmup 3 --iters 10
+```text
+Deltanet_v2/
+├── include/                    # CUDA/CuTe headers (deltanet_common.cuh, deltanet_ops.cuh)
+├── src/                        # Fused CUDA kernels & PyTorch dispatcher bindings
+├── deltanet_v2/                # Python package (ops.py, model.py)
+├── tests/                      # Correctness suites & inference/training benchmarks
+├── benchmark/                  # Reproducible benchmark & profiling notebook (deltanet.ipynb)
+├── assets/                     # Benchmark plots
+├── wheels/                     # Pre-compiled .whl distribution
+├── demo.ipynb                  # Google Colab / Kaggle quick-start notebook
+├── setup.py                    # CMake/CUDA build with C++20/17 fallback
+├── pyproject.toml
+├── requirements.txt
+└── LICENSE                     # Apache License 2.0
 ```
 
 ---
 
-## 📂 Project Structure
+## License
 
-```
-Deltanet/
-├── include/
-│   ├── deltanet_common.cuh       # Math utilities, activations, warp reduction
-│   └── deltanet_ops.cuh          # Kernel declarations & host coordinators
-├── src/
-│   ├── binding.cpp               # PyTorch dispatcher & Python C-extension
-│   ├── chunk_wy_fwd.cu           # Chunk WY forward kernel
-│   ├── chunk_wy_bwd.cu           # Chunk WY backward kernel
-│   ├── chunk_scan_fwd.cu         # Recurrence scan forward kernel
-│   ├── chunk_scan_bwd.cu         # Recurrence scan backward kernel
-│   ├── output_combine_fwd.cu     # Output combination forward kernel
-│   ├── output_combine_bwd.cu     # Output combination backward kernels
-│   ├── deltanet.cu               # Forward & backward pipeline coordinators
-│   └── deltanet_infer.cu         # Fast single-step (L = 1) inference kernel
-├── deltanet_v2/
-│   ├── __init__.py               # Package exports
-│   ├── ops.py                    # Op dispatcher, fake tensor registrations, autograd
-│   └── model.py                  # Full DeltaBlock PyTorch module
-├── tests/
-│   ├── utils.py                  # CUDA event timers, VRAM tracking, baseline loaders
-│   ├── bench_inference.py        # Autoregressive decode step (L = 1) benchmark
-│   ├── bench_training.py         # Forward + Backward training pass benchmark
-│   └── test_correctness.py       # Numerical consistency verification vs PyTorch
-├── assets/
-│   ├── benchmark_compiled_e2e.png            # End-to-end benchmark chart
-│   ├── benchmark_opensource_baselines.png    # Open-source baselines comparison chart
-│   └── ncu_kernel_summary.png                # Nsight Compute hardware profiling summary
-├── third_party/
-│   └── cutlass/                  # Dedicated NVIDIA CUTLASS / CuTe submodule (>= 3.0)
-├── wheels/                       # Pre-compiled standalone .whl distributions
-├── demo.ipynb                    # Colab / Kaggle runner notebook (/content)
-├── setup.py                      # Build script with auto-CUTLASS discovery
-├── pyproject.toml                # PEP 517/518 build specification
-├── requirements.txt              # Build and runtime Python dependencies
-├── LICENSE                       # Apache 2.0 License
-└── README.md
-```
-
----
-
-## 📜 License
-
-This project is licensed under the **Apache License 2.0**. You are free to use, modify, and distribute this software for personal, academic, and commercial purposes. See [LICENSE](LICENSE) for details.
+This project is licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.

@@ -1,13 +1,18 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
+#include <tuple>
+
+#include <cute/tensor.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <tuple>
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
+
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
 
@@ -102,8 +107,8 @@ kernel_deltanet_infer(
 
     // 1. GMEM Tensor for past state matrix S (64 x 64)
     Tensor gS = make_tensor(make_gmem_ptr(past_state_ptr + offset_S),
-                            make_shape(Int<D_V>{}, Int<D_K>{}),
-                            make_stride(Int<D_K>{}, Int<1>{}));
+                            make_layout(make_shape(Int<D_V>{}, Int<D_K>{}),
+                                        make_stride(Int<D_K>{}, Int<1>{})));
 
     // 2. GMEM Tensors for 1D vectors mapped to 2D broadcast layout (16 x 64, stride (0, 1))
     auto bcast_layout = make_layout(make_shape(Int<16>{}, Int<D_K>{}), make_stride(Int<0>{}, Int<1>{}));
@@ -139,7 +144,7 @@ kernel_deltanet_infer(
     Tensor r_out      = make_fragment_like(tVgV);
 
     // Predication tensor for 1D vector writes to GMEM (leader thread row_id == 0 only)
-    Tensor tVpOut = make_tensor<bool>(shape(r_out));
+    Tensor tVpOut = make_tensor<bool>(make_layout(shape(r_out), LayoutRight{}));
     #pragma unroll
     for (int i = 0; i < size(tVpOut); ++i) {
         tVpOut(i) = (row_id == 0);
@@ -277,7 +282,7 @@ kernel_deltanet_infer(
         for (int g = 0; g < FIXED_G; ++g) {
             Tensor gQ_g   = make_tensor(make_gmem_ptr(q_ptr + offset_q_base + g * D_K), bcast_layout);
             auto   tVgQ_g = thr_copy_vec.partition_S(gQ_g);
-            Tensor r_q_g  = make_tensor(make_rmem_ptr(&r_q_storage(g, 0)), shape(tVgK));
+            Tensor r_q_g  = make_tensor(make_rmem_ptr(&r_q_storage(g, 0)), make_layout(shape(tVgK), LayoutRight{}));
             cute::copy(tiled_copy_vec, tVgQ_g, r_q_g);
         }
 
@@ -321,8 +326,8 @@ kernel_deltanet_infer(
 
             // 4. Store 128-bit out_g to GMEM with leader-thread predication
             Tensor gOut_g   = make_tensor(make_gmem_ptr(out_ptr + offset_out_base + g * D_V),
-                                          make_shape(Int<16>{}, Int<D_V>{}),
-                                          make_stride(Int<D_V>{}, Int<1>{}));
+                                          make_layout(make_shape(Int<16>{}, Int<D_V>{}),
+                                                      make_stride(Int<D_V>{}, Int<1>{})));
             auto   tVgOut_g = thr_copy_vec.partition_D(gOut_g);
             cute::copy_if(tiled_copy_vec, tVpOut, r_out, tVgOut_g);
             __syncthreads();
@@ -333,7 +338,7 @@ kernel_deltanet_infer(
         for (int g = 0; g < G; ++g) {
             Tensor gQ_g   = make_tensor(make_gmem_ptr(q_ptr + offset_q_base + g * D_K), bcast_layout);
             auto   tVgQ_g = thr_copy_vec.partition_S(gQ_g);
-            Tensor r_q_0  = make_tensor(make_rmem_ptr(&r_q_storage(0, 0)), shape(tVgK));
+            Tensor r_q_0  = make_tensor(make_rmem_ptr(&r_q_storage(0, 0)), make_layout(shape(tVgK), LayoutRight{}));
             cute::copy(tiled_copy_vec, tVgQ_g, r_q_0);
 
             #pragma unroll
@@ -367,8 +372,8 @@ kernel_deltanet_infer(
             }
 
             Tensor gOut_g   = make_tensor(make_gmem_ptr(out_ptr + offset_out_base + g * D_V),
-                                          make_shape(Int<16>{}, Int<D_V>{}),
-                                          make_stride(Int<D_V>{}, Int<1>{}));
+                                          make_layout(make_shape(Int<16>{}, Int<D_V>{}),
+                                                      make_stride(Int<D_V>{}, Int<1>{})));
             auto   tVgOut_g = thr_copy_vec.partition_D(gOut_g);
             cute::copy_if(tiled_copy_vec, tVpOut, r_out, tVgOut_g);
             __syncthreads();

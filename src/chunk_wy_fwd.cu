@@ -1,10 +1,20 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <cstdint>
+#include <tuple>
+
 #include <cute/tensor.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/arch/copy_sm75.hpp>
+#include <cute/arch/mma_sm75.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
+
+#include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
@@ -209,10 +219,10 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
     const T* p_w_gate_chunk = gW_gate + head_offset * D_V + (int64_t)chunk_start_token * D_V;
     const T* p_gamma_chunk  = gGamma  + head_offset;
 
-    auto gK_chunk   = make_tensor(make_gmem_ptr(p_k_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
-    auto gV_chunk   = make_tensor(make_gmem_ptr(p_v_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
-    auto gB_chunk   = make_tensor(make_gmem_ptr(p_b_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
-    auto gW_g_chk   = make_tensor(make_gmem_ptr(p_w_gate_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
+    auto gK_chunk   = make_tensor(make_gmem_ptr(p_k_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto gV_chunk   = make_tensor(make_gmem_ptr(p_v_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
+    auto gB_chunk   = make_tensor(make_gmem_ptr(p_b_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto gW_g_chk   = make_tensor(make_gmem_ptr(p_w_gate_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
 
     auto dummy_tile = local_tile(sU_flat, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(0, 0));
     auto dummy_part = thr_copy_g2r.partition_S(dummy_tile);
@@ -348,7 +358,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
     // Concurrently compute V_new = sigmoid(W_gate) * (V * sqrt_gamma) and store into sV
     int64_t mat_offset_w = ((int64_t)head_idx * num_chunks + chunk_idx) * ((int64_t)D_K * D_K);
     T* p_w_mat_chunk = gW + mat_offset_w;
-    auto gW_chunk = make_tensor(make_gmem_ptr(p_w_mat_chunk), make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+    auto gW_chunk = make_tensor(make_gmem_ptr(p_w_mat_chunk), make_layout(make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
     #pragma unroll
     for (int st = 0; st < NUM_STPS; ++st) {
@@ -416,7 +426,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_fwd(
     // Store Y to GMEM via vectorized stores
     int64_t mat_offset_y = ((int64_t)head_idx * num_chunks + chunk_idx) * ((int64_t)D_V * D_K);
     T* p_y_mat_chunk = gY + mat_offset_y;
-    auto gY_chunk = make_tensor(make_gmem_ptr(p_y_mat_chunk), make_shape(Int<D_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+    auto gY_chunk = make_tensor(make_gmem_ptr(p_y_mat_chunk), make_layout(make_shape(Int<D_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
     #pragma unroll
     for (int st = 0; st < NUM_STPS; ++st) {
@@ -517,7 +527,7 @@ chunk_wy_fwd(
 
     using Element = cutlass::half_t;
     using MMAAtom = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
-    using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_2, _2, _1>>>;
+    using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_2, _2, _1>, Stride<_1, _2, _4>>>;
 
     using S2RCopyAtomA = Copy_Atom<SM75_U16x4_LDSM_T, Element>;
     using S2RCopyAtomB = Copy_Atom<SM75_U16x2_LDSM_T, Element>;
@@ -526,14 +536,14 @@ chunk_wy_fwd(
     using TiledCopyG2R = decltype(make_tiled_copy(
         CopyAtomG2R{},
         Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-        Layout<Shape<_1, _8>>{}
+        Layout<Shape<_1, _8>, Stride<_8, _1>>{}
     ));
 
     using CopyAtomStore = Copy_Atom<UniversalCopy<uint4>, Element>;
     using TiledCopyStore = decltype(make_tiled_copy(
         CopyAtomStore{},
         Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-        Layout<Shape<_1, _8>>{}
+        Layout<Shape<_1, _8>, Stride<_8, _1>>{}
     ));
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

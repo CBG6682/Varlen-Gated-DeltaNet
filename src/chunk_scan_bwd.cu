@@ -1,15 +1,23 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
+#include <optional>
+#include <tuple>
+#include <vector>
+
+#include <cute/tensor.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/arch/copy_sm75.hpp>
+#include <cute/arch/mma_sm75.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-#include <tuple>
-#include <optional>
-#include <vector>
+
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
 
@@ -168,10 +176,10 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
     if (start_c >= end_c) {
         if (has_state_old && gGradStateOld != nullptr) {
             T* p_grad_state_old = gGradStateOld + state_offset;
-            auto gGradStateOld_chunk = make_tensor(make_gmem_ptr(p_grad_state_old), make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+            auto gGradStateOld_chunk = make_tensor(make_gmem_ptr(p_grad_state_old), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
             if (gGradFinalStates != nullptr) {
                 const T* p_grad_final = gGradFinalStates + state_offset;
-                auto gGradFinal_chunk = make_tensor(make_gmem_ptr(p_grad_final), make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+                auto gGradFinal_chunk = make_tensor(make_gmem_ptr(p_grad_final), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
                 #pragma unroll
                 for (int st = 0; st < NUM_STPS_V; ++st) {
                     auto gGradFinal_step    = local_tile(gGradFinal_chunk,    make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
@@ -197,7 +205,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
     // -------------------------------------------------------------------------------------
     if (gGradFinalStates != nullptr) {
         const T* p_grad_final = gGradFinalStates + state_offset;
-        auto gGradFinal_chunk = make_tensor(make_gmem_ptr(p_grad_final), make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+        auto gGradFinal_chunk = make_tensor(make_gmem_ptr(p_grad_final), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
         #pragma unroll
         for (int st = 0; st < NUM_STPS_V; ++st) {
@@ -228,7 +236,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
 
         // 1. Prefetch W_c from GMEM into registers rW_tmp (NUM_STPS_K steps)
         const T* p_w_curr = gW + chunk_mat_offset_k;
-        auto gW_chunk = make_tensor(make_gmem_ptr(p_w_curr), make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+        auto gW_chunk = make_tensor(make_gmem_ptr(p_w_curr), make_layout(make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
         #pragma unroll
         for (int st = 0; st < NUM_STPS_K; ++st) {
@@ -238,7 +246,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
 
         // 2. Store gradient dY[:, c] = Delta_S to GMEM while prefetching W_c
         T* p_gy = gGradY + chunk_mat_offset_v;
-        auto gGradY_chunk = make_tensor(make_gmem_ptr(p_gy), make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+        auto gGradY_chunk = make_tensor(make_gmem_ptr(p_gy), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
         #pragma unroll
         for (int st = 0; st < NUM_STPS_V; ++st) {
@@ -283,7 +291,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
 
         // 5. Accumulate Delta_S_new = Delta_S_accum + grad_S_list[:, c] into sDeltaS
         const T* p_grad_s = gGradSList + chunk_mat_offset_v;
-        auto gGradS_chunk = make_tensor(make_gmem_ptr(p_grad_s), make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+        auto gGradS_chunk = make_tensor(make_gmem_ptr(p_grad_s), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
         #pragma unroll
         for (int st = 0; st < NUM_STPS_V; ++st) {
@@ -317,7 +325,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
     // -------------------------------------------------------------------------------------
     if (has_state_old && gGradStateOld != nullptr) {
         T* p_grad_state_old = gGradStateOld + state_offset;
-        auto gGradStateOld_chunk = make_tensor(make_gmem_ptr(p_grad_state_old), make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+        auto gGradStateOld_chunk = make_tensor(make_gmem_ptr(p_grad_state_old), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
         #pragma unroll
         for (int st = 0; st < NUM_STPS_V; ++st) {
@@ -469,7 +477,7 @@ chunk_scan_bwd(
 
         using MMAAtomOp = SM75_16x8x8_F32F16F16F32_TN;
         using MMAAtom   = MMA_Atom<MMAAtomOp>;
-        using TiledMMA  = TiledMMA<MMAAtom, Layout<Shape<_1, _4, _1>>>;
+        using TiledMMA  = TiledMMA<MMAAtom, Layout<Shape<_1, _4, _1>, Stride<_1, _1, _4>>>;
 
         using S2RCopyAtomA = Copy_Atom<SM75_U32x2_LDSM_N, T>;
         using S2RCopyAtomB = Copy_Atom<SM75_U32x1_LDSM_N, T>;

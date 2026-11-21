@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 from setuptools import find_packages, setup
@@ -211,7 +212,29 @@ if should_compile:
             },
         ),
     ]
-    cmdclass = {"build_ext": BuildExtension}
+
+    class Cpp20WithCpp17FallbackBuildExtension(BuildExtension):
+        """Compile with C++20 by default; fall back to C++17 only on build error."""
+
+        def build_extensions(self):
+            try:
+                super().build_extensions()
+            except Exception as exc:
+                if os.environ.get("CXX_STANDARD") == "c++17":
+                    raise
+                print(f"[setup.py] C++20 build failed ({exc}). Falling back to C++17...")
+                for ext in self.extensions:
+                    for key in ("cxx", "nvcc"):
+                        if key in ext.extra_compile_args:
+                            ext.extra_compile_args[key] = [
+                                "-std=c++17" if flag == "-std=c++20" else flag
+                                for flag in ext.extra_compile_args[key]
+                            ]
+                if os.path.isdir(self.build_temp):
+                    shutil.rmtree(self.build_temp, ignore_errors=True)
+                super().build_extensions()
+
+    cmdclass = {"build_ext": Cpp20WithCpp17FallbackBuildExtension}
 
 setup(
     name="deltanet_v2",

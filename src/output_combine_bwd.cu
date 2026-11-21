@@ -1,13 +1,21 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
+#include <tuple>
+
+#include <cute/tensor.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/arch/copy_sm75.hpp>
+#include <cute/arch/mma_sm75.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-#include <tuple>
+
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
 
@@ -156,7 +164,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     auto sA_G3 = make_tensor(make_smem_ptr(s_Q), smem_layout_A_G3);
     auto sB_G3 = make_tensor(make_smem_ptr(s_S), smem_layout_B_G3);
 
-    // Layout C cho partition_C
+    // Layout C for partition_C
     auto smem_layout_C_dS = composition(SwizzleOp{}, make_layout(make_shape(Int<D_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
     auto smem_layout_C_QS = composition(SwizzleOp{}, make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
     auto smem_layout_C_dq = composition(SwizzleOp{}, make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
@@ -252,7 +260,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     }
     __syncthreads(); // Release smem_4 completely to load Q
 
-    // Caching registers cho dc_inter (2 repeats m_rep x 2 rows a/b)
+    // Caching registers for dc_inter (2 repeats m_rep x 2 rows a/b)
     float r_dc_inter_a[2] = {0.0f, 0.0f};
     float r_dc_inter_b[2] = {0.0f, 0.0f};
 
@@ -464,7 +472,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
     // -------------------------------------------------------------------------------------
     __syncthreads(); // Ensure all warps have finished loop g
 
-    // 1. Quad reduction (warp shuffle) cho r_dc_inter
+    // 1. Quad reduction (warp shuffle) for r_dc_inter
     #pragma unroll
     for (int m_rep = 0; m_rep < 2; ++m_rep) {
         #pragma unroll
@@ -565,7 +573,7 @@ struct SmemStorageKernel1 {
 // Kernel 1: kernel_output_combine_dq_dk_dv
 // -----------------------------------------------------------------------------------------
 // Execution Flow Summary:
-// - Grid: (num_kv_heads, num_chunks), Block: 128 threads (4 warps theo TiledMMA Shape<_4, _1, _1>).
+// - Grid: (num_kv_heads, num_chunks), Block: 128 threads (4 warps with TiledMMA Shape<_4, _1, _1>).
 // - Dynamic Shared Memory 56.25 KB (57,600 bytes < 63 KB):
 //   * Region 1 (smem_1 - 8 KB): dO of current group g.
 //   * Region 2 (smem_2 - 8 KB): Q of current group g; stages dk in final epilogue.
@@ -1534,8 +1542,8 @@ output_combine_bwd(
 
     using MMAAtomOp = SM75_16x8x8_F32F16F16F32_TN;
     using MMAAtom   = MMA_Atom<MMAAtomOp>;
-    using TiledMMA_411 = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>>>;
-    using TiledMMA_221 = TiledMMA<MMAAtom, Layout<Shape<_2, _2, _1>>>;
+    using TiledMMA_411 = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>, Stride<_1, _4, _4>>>;
+    using TiledMMA_221 = TiledMMA<MMAAtom, Layout<Shape<_2, _2, _1>, Stride<_1, _2, _4>>>;
 
     // S2R Copy Atoms
     using S2RCopyAtomA_KMajor   = Copy_Atom<SM75_U32x2_LDSM_N, T>;

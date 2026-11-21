@@ -1,12 +1,19 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
+
+#include <cute/tensor.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/arch/copy_sm75.hpp>
+#include <cute/arch/mma_sm75.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
 
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
@@ -551,7 +558,7 @@ output_combine_fwd(
 
     using Element = cutlass::half_t;
     using MMAAtom = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
-    using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>>>;
+    using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>, Stride<_1, _4, _4>>>;
 
     using S2RCopyAtomA          = Copy_Atom<SM75_U32x2_LDSM_N, Element>;
     using S2RCopyAtomB_KMajor   = Copy_Atom<SM75_U32x1_LDSM_N, Element>;

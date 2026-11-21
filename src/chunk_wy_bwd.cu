@@ -1,10 +1,20 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <cstdint>
+#include <tuple>
+
 #include <cute/tensor.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/arch/copy_sm75.hpp>
+#include <cute/arch/mma_sm75.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
+
+#include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
@@ -225,10 +235,10 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     const T* p_w_gate_chunk = gW_gate + head_offset * D_V + (int64_t)chunk_start_token * D_V;
     const T* p_gamma_chunk  = gGamma  + head_offset;
 
-    auto gK_chunk   = make_tensor(make_gmem_ptr(p_k_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
-    auto gV_chunk   = make_tensor(make_gmem_ptr(p_v_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
-    auto gB_chunk   = make_tensor(make_gmem_ptr(p_b_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
-    auto gW_g_chk   = make_tensor(make_gmem_ptr(p_w_gate_chunk), make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
+    auto gK_chunk   = make_tensor(make_gmem_ptr(p_k_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto gV_chunk   = make_tensor(make_gmem_ptr(p_v_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
+    auto gB_chunk   = make_tensor(make_gmem_ptr(p_b_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto gW_g_chk   = make_tensor(make_gmem_ptr(p_w_gate_chunk), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
 
     auto dummy_tile = local_tile(sU_flat, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(0, 0));
     auto dummy_part = thr_copy_g2r.partition_S(dummy_tile);
@@ -326,7 +336,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     // -------------------------------------------------------------------------------------
     int64_t mat_offset_y = ((int64_t)head_idx * num_chunks + chunk_idx) * ((int64_t)D_V * D_K);
     const T* p_dy_chunk = gdY + mat_offset_y;
-    auto gDY_chunk = make_tensor(make_gmem_ptr(p_dy_chunk), make_shape(Int<D_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+    auto gDY_chunk = make_tensor(make_gmem_ptr(p_dy_chunk), make_layout(make_shape(Int<D_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
     #pragma unroll
     for (int st = 0; st < NUM_STPS; ++st) {
@@ -369,7 +379,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     // -------------------------------------------------------------------------------------
     int64_t mat_offset_w = ((int64_t)head_idx * num_chunks + chunk_idx) * ((int64_t)D_K * D_K);
     const T* p_dw_chunk = gdW + mat_offset_w;
-    auto gDW_chunk = make_tensor(make_gmem_ptr(p_dw_chunk), make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+    auto gDW_chunk = make_tensor(make_gmem_ptr(p_dw_chunk), make_layout(make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
 
     #pragma unroll
     for (int st = 0; st < NUM_STPS; ++st) {
@@ -426,18 +436,18 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
     const T* p_dk_ext = gDK_ext + head_offset * D_K + (int64_t)chunk_start_token * D_K;
     const T* p_dv_ext = gDV_ext + head_offset * D_V + (int64_t)chunk_start_token * D_V;
 
-    auto gDK_ext_chk = make_tensor(make_gmem_ptr(p_dk_ext), make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
-    auto gDV_ext_chk = make_tensor(make_gmem_ptr(p_dv_ext), make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
+    auto gDK_ext_chk = make_tensor(make_gmem_ptr(p_dk_ext), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto gDV_ext_chk = make_tensor(make_gmem_ptr(p_dv_ext), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
 
     T* p_dk_out = gDK + head_offset * D_K + (int64_t)chunk_start_token * D_K;
     T* p_dv_out = gDV + head_offset * D_V + (int64_t)chunk_start_token * D_V;
     T* p_db_out = gDB + head_offset * D_K + (int64_t)chunk_start_token * D_K;
     T* p_dw_out = gDW + head_offset * D_V + (int64_t)chunk_start_token * D_V;
 
-    auto gDK_out_chk = make_tensor(make_gmem_ptr(p_dk_out), make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
-    auto gDV_out_chk = make_tensor(make_gmem_ptr(p_dv_out), make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
-    auto gDB_out_chk = make_tensor(make_gmem_ptr(p_db_out), make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
-    auto gDW_out_chk = make_tensor(make_gmem_ptr(p_dw_out), make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
+    auto gDK_out_chk = make_tensor(make_gmem_ptr(p_dk_out), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto gDV_out_chk = make_tensor(make_gmem_ptr(p_dv_out), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
+    auto gDB_out_chk = make_tensor(make_gmem_ptr(p_db_out), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto gDW_out_chk = make_tensor(make_gmem_ptr(p_dw_out), make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_V>{}), make_stride(Int<D_V>{}, Int<1>{})));
 
     #pragma unroll
     for (int st = 0; st < NUM_STPS; ++st) {
@@ -575,7 +585,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_wy_bwd(
         }
         #pragma unroll
         for (int mask = 4; mask > 0; mask /= 2) {
-            thread_term_sum += __shfl_xor_sync(0xffffffff, thread_sq_sum, mask);
+            thread_term_sum += __shfl_xor_sync(0xffffffff, thread_term_sum, mask);
         }
         if (col_vec_idx == 0 && row_valid) {
             s_da[local_row] = -thread_term_sum;
@@ -803,7 +813,7 @@ chunk_wy_bwd(
 
     using Element = cutlass::half_t;
     using MMAAtom = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
-    using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_2, _2, _1>>>;
+    using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_2, _2, _1>, Stride<_1, _2, _4>>>;
 
     using S2RCopyAtomA       = Copy_Atom<SM75_U32x2_LDSM_N, Element>;
     using S2RCopyAtomB_KMaj  = Copy_Atom<SM75_U32x1_LDSM_N, Element>;
@@ -813,14 +823,14 @@ chunk_wy_bwd(
     using TiledCopyG2R = decltype(make_tiled_copy(
         CopyAtomG2R{},
         Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-        Layout<Shape<_1, _8>>{}
+        Layout<Shape<_1, _8>, Stride<_8, _1>>{}
     ));
 
     using CopyAtomStore = Copy_Atom<UniversalCopy<uint4>, Element>;
     using TiledCopyStore = decltype(make_tiled_copy(
         CopyAtomStore{},
         Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-        Layout<Shape<_1, _8>>{}
+        Layout<Shape<_1, _8>, Stride<_8, _1>>{}
     ));
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

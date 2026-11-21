@@ -1,11 +1,13 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <optional>
+#include <tuple>
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <tuple>
-#include <optional>
+
 #include "deltanet_common.cuh"
 #include "deltanet_ops.cuh"
 

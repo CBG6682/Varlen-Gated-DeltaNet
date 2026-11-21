@@ -8,6 +8,7 @@ to ensure direct and fair comparison of the recurrence kernels.
 """
 
 import argparse
+import json
 import os
 import sys
 import warnings
@@ -395,7 +396,7 @@ def run_inference_benchmark(
     print("=" * 72)
     print(table_md)
     print("=" * 72 + "\n")
-    return all_results
+    return all_results, table_md, rows
 
 
 def parse_args():
@@ -411,6 +412,7 @@ def parse_args():
     parser.add_argument("--use-conv", action="store_true", help="Enable ShortConvolution in baselines (default: False)")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 instead of float16")
     parser.add_argument("--save-md", type=str, default=None, help="Save markdown table to file")
+    parser.add_argument("--save-json", type=str, default=None, help="Save benchmark rows as JSON")
     return parser.parse_args()
 
 
@@ -422,7 +424,7 @@ if __name__ == "__main__":
     b_list = [int(b.strip()) for b in args.batches.split(",") if b.strip()]
     dtype = torch.bfloat16 if args.bf16 else torch.float16
 
-    results = run_inference_benchmark(
+    results, table_md, rows = run_inference_benchmark(
         d_model=args.dim,
         num_q_heads=args.q_heads,
         num_kv_heads=args.kv_heads,
@@ -434,3 +436,21 @@ if __name__ == "__main__":
         use_short_conv=args.use_conv,
         dtype=dtype,
     )
+    if args.save_md:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_md)), exist_ok=True)
+        with open(args.save_md, "w", encoding="utf-8") as f:
+            f.write(table_md + "\n")
+    if args.save_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)
+        payload = [
+            {
+                "batch_size": r[0],
+                "method": r[1].replace("**", ""),
+                "latency_ms": float(r[2].replace("**", "")) if r[2].replace("**", "").replace(".", "", 1).isdigit() else None,
+                "throughput_tok_s": float(r[3].replace("**", "").replace(",", "")) if r[3].replace("**", "").replace(",", "").replace(".", "", 1).isdigit() else None,
+                "peak_mb": float(r[7].replace("**", "")) if r[7].replace("**", "").replace(".", "", 1).isdigit() else None,
+            }
+            for r in rows
+        ]
+        with open(args.save_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)

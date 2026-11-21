@@ -5,6 +5,7 @@ Provides precise CUDA event timing, peak VRAM memory tracking, and dynamic basel
 
 import gc
 import os
+import random
 import sys
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -508,3 +509,197 @@ def print_section(title: str) -> None:
     print("\n" + "#" * 72)
     print(f"# {title}")
     print("#" * 72 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Correctness & Varlen Helpers
+# ---------------------------------------------------------------------------
+
+def seed_everything(seed: int = 42, disable_tf32: bool = True) -> None:
+    """Seed Python, PyTorch, and CUDA RNGs for reproducible correctness tests."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        if disable_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+
+
+def make_cu_seqlens(
+    lengths: List[int], device: torch.device
+) -> Tuple[torch.Tensor, int]:
+    """Build cumulative sequence lengths tensor (int32) and max sequence length."""
+    lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    cu_seqlens = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = torch.cumsum(lens, dim=0).to(torch.int32)
+    max_len = int(lens.max().item()) if len(lengths) > 0 else 0
+    return cu_seqlens.contiguous(), max_len
+
+
+def make_varlen_inputs(
+    seqlens: List[int],
+    d_model: int,
+    scale: float = 1.0,
+    device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.float16,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate padded + packed varlen inputs, padding mask, and cu_seqlens."""
+    B = len(seqlens)
+    cu_seqlens, Lmax = make_cu_seqlens(seqlens, device)
+    lens = torch.tensor(seqlens, dtype=torch.int32, device=device)
+    mask = torch.arange(Lmax, device=device).unsqueeze(0) < lens.unsqueeze(1)
+    x_pad = (torch.randn(B, Lmax, d_model, device=device, dtype=torch.float32) * scale).to(dtype)
+    x_pad = (x_pad * mask.unsqueeze(-1)).contiguous()
+    x_var = x_pad[mask].contiguous()
+    return x_pad, x_var, mask.contiguous(), cu_seqlens
+
+
+def compute_tensor_metrics(
+    actual: torch.Tensor, expected: torch.Tensor
+) -> Tuple[float, float, float]:
+    """Return (rel_l2, cos_sim, max_abs) in float64."""
+    a = actual.detach().double().reshape(-1)
+    b = expected.detach().double().reshape(-1)
+    if a.numel() == 0:
+        return 0.0, 1.0, 0.0
+    diff = a - b
+    diff_norm = diff.norm().item()
+    b_norm = b.norm().item()
+    rel_l2 = diff_norm / (b_norm + 1e-12)
+    max_abs = diff.abs().max().item()
+    a_norm = a.norm().item()
+    if a_norm == 0.0 and b_norm == 0.0:
+        cos_sim = 1.0
+    elif a_norm == 0.0 or b_norm == 0.0:
+        cos_sim = 0.0
+    else:
+        cos_sim = float(torch.dot(a, b).item() / (a_norm * b_norm + 1e-12))
+    return rel_l2, cos_sim, max_abs
+
+
+def worst_group_rel(
+    actual: torch.Tensor, expected: torch.Tensor, lead_dims: int
+) -> float:
+    """Compute max per-group L2 error normalized by mean group truth norm.
+
+    Dividing by the mean truth norm avoids exploding relative errors when an
+    individual token or (seq, head) slice happens to have near-zero norm.
+    """
+    if actual.numel() == 0:
+        return 0.0
+    a = actual.detach().double().flatten(0, lead_dims - 1).flatten(1)
+    b = expected.detach().double().flatten(0, lead_dims - 1).flatten(1)
+    d = (a - b).norm(dim=1)
+    nb = b.norm(dim=1)
+    return float((d.max() / (nb.mean() + 1e-30)).item())
+
+
+def check_allclose(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+    verbose: bool = True,
+) -> Tuple[bool, float, float]:
+    """Compare tensors in float64 against (atol, rtol) and finite check."""
+    a = actual.detach().double()
+    b = expected.detach().double()
+    if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        if verbose:
+            print(f"    [FAIL] {name:<26} non-finite values detected!")
+        return False, float("inf"), float("inf")
+    if a.numel() == 0:
+        if verbose:
+            print(f"    [PASS] {name:<26} empty tensor match")
+        return True, 0.0, 0.0
+    diff = (a - b).abs()
+    max_abs = float(diff.max().item())
+    max_rel = float((diff / b.abs().clamp_min(1e-6)).max().item())
+    passed = bool(torch.allclose(a, b, atol=atol, rtol=rtol))
+    if verbose:
+        status = "PASS" if passed else "FAIL"
+        rel_l2, cos_sim, _ = compute_tensor_metrics(a, b)
+        print(
+            f"    [{status}] {name:<26} rel_l2={rel_l2:.3e} cos={cos_sim:.6f} "
+            f"max_abs={max_abs:.3e}"
+        )
+    return passed, max_abs, max_rel
+
+
+def check_dual_precision(
+    name: str,
+    kernel_val: torch.Tensor,
+    baseline_fp16_val: Optional[torch.Tensor],
+    truth_val: torch.Tensor,
+    abs_cap: float = 1e-1,
+    abs_cap_group: float = 1e-1,
+    lead_dims: Optional[int] = None,
+    use_ratio: bool = True,
+    ratio_fail: float = 8.0,
+    ratio_warn: float = 4.0,
+    err_floor: float = 3e-4,
+    verbose: bool = True,
+) -> Tuple[bool, float, float]:
+    """Dual-criterion check comparing kernel and FP16 baseline against FP32/FP64 truth."""
+    if not torch.isfinite(kernel_val).all():
+        if verbose:
+            print(f"    [FAIL] {name:<24} non-finite kernel values!")
+        return False, float("inf"), float("inf")
+
+    kr, kc, km = compute_tensor_metrics(kernel_val, truth_val)
+    kw = (
+        worst_group_rel(kernel_val, truth_val, lead_dims)
+        if lead_dims is not None
+        else None
+    )
+
+    if baseline_fp16_val is not None:
+        br, bc, bm = compute_tensor_metrics(baseline_fp16_val, truth_val)
+        bw = (
+            worst_group_rel(baseline_fp16_val, truth_val, lead_dims)
+            if lead_dims is not None
+            else None
+        )
+    else:
+        br, bc, bm, bw = float("nan"), float("nan"), float("nan"), None
+
+    def _eval_one(k_err: float, b_err: Optional[float], cap: float) -> Tuple[str, Optional[float]]:
+        if k_err != k_err or k_err > cap:
+            return "FAIL", None
+        if use_ratio and b_err is not None:
+            base = err_floor if b_err != b_err else max(b_err, err_floor)
+            ratio = k_err / base
+            if ratio > ratio_fail:
+                return "FAIL", ratio
+            return "PASS", ratio
+        return "PASS", None
+
+    tag, r_main = _eval_one(kr, br, abs_cap)
+    r_grp = None
+    if kw is not None:
+        tag_w, r_grp = _eval_one(kw, bw, abs_cap_group)
+        if tag_w == "FAIL":
+            tag = "FAIL"
+
+    passed = tag != "FAIL"
+    if verbose:
+        base_str = (
+            f"{br:.2e} {bc:.6f} {bm:.1e}"
+            if baseline_fp16_val is not None
+            else f"{'N/A':>24}"
+        )
+        grp_str = (
+            f" | grp {kw:.2e} {bw:.2e}"
+            if kw is not None and bw is not None
+            else (f" | grp {kw:.2e}" if kw is not None else "")
+        )
+        max_r = max((r for r in (r_main, r_grp) if r is not None), default=0.0)
+        note = f" (~{max_r:.1f}x base)" if max_r > ratio_warn else ""
+        print(
+            f"    [{tag:<4}] {name:<20} | {kr:.2e} {kc:.6f} {km:.1e} "
+            f"| {base_str}{grp_str}{note}"
+        )
+    return passed, kr, br
+

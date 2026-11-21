@@ -60,9 +60,9 @@ class DeltaBlock(nn.Module):
             self.d_q_total,  # q
             self.d_k_total,  # k
             self.d_v_total,  # v
-            num_kv_heads,    # alpha (decay gate)
             self.d_k_total,  # b (erase gate)
             self.d_v_total,  # w (write gate)
+            num_kv_heads,    # alpha (decay gate)
             num_kv_heads,    # gamma (L2 scaler)
         ]
         self.total_proj_dim = sum(self.split_sizes)
@@ -125,7 +125,7 @@ class DeltaBlock(nn.Module):
         if proj.dtype != torch.float16:
             proj = proj.to(torch.float16)
 
-        q_raw, k_raw, v_raw, a_raw, b_raw, w_raw, g_raw = torch.split(
+        q_raw, k_raw, v_raw, b_raw, w_raw, a_raw, g_raw = torch.split(
             proj, self.split_sizes, dim=-1
         )
         q = _headfirst(q_raw, L, Hq, d_k)
@@ -185,7 +185,7 @@ class DeltaBlock(nn.Module):
         if proj.dtype != torch.float16:
             proj = proj.to(torch.float16)
 
-        q, k, v, a, b, w, g = torch.split(proj, self.split_sizes, dim=-1)
+        q, k, v, b, w, a, g = torch.split(proj, self.split_sizes, dim=-1)
 
         q = q.view(B, Hq, d_k).contiguous()
         k = k.view(B, H, d_k).contiguous()
@@ -252,7 +252,7 @@ class DeltaBlock(nn.Module):
             m = padding_mask[:, :, None, None]
             x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
 
-        q_raw, k_raw, v_raw, alpha_raw, b_raw, w_raw, gamma_raw = torch.split(
+        q_raw, k_raw, v_raw, b_raw, w_raw, alpha_raw, gamma_raw = torch.split(
             self.W_proj(x), self.split_sizes, dim=-1
         )
 
@@ -396,7 +396,7 @@ class DeltaBlock(nn.Module):
             L = end - start
 
             proj = self.W_proj(x_seq)
-            q_raw, k_raw, v_raw, alpha_raw, b_raw, w_raw, gamma_raw = torch.split(
+            q_raw, k_raw, v_raw, b_raw, w_raw, alpha_raw, gamma_raw = torch.split(
                 proj, self.split_sizes, dim=-1
             )
 
@@ -496,7 +496,7 @@ class DeltaBlock(nn.Module):
         dtype = x.dtype
 
         proj = self.W_proj(x_2d)
-        q_raw, k_raw, v_raw, alpha_raw, b_raw, w_raw, gamma_raw = torch.split(
+        q_raw, k_raw, v_raw, b_raw, w_raw, alpha_raw, gamma_raw = torch.split(
             proj, self.split_sizes, dim=-1
         )
 

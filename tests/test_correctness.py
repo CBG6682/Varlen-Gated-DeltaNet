@@ -173,7 +173,7 @@ def _ref_decode_block_step(
     """Single-step DeltaBlock decode reference matching DeltaBlock architecture."""
     B = x_2d.shape[0]
     H, Hq, dk, dv = model.num_kv_heads, model.num_q_heads, model.d_k, model.d_v
-    q_r, k_r, v_r, a_r, b_r, w_r, g_r = torch.split(
+    q_r, k_r, v_r, b_r, w_r, a_r, g_r = torch.split(
         model.W_proj(x_2d), model.split_sizes, dim=-1
     )
     o, S_new = _ref_core_step(
@@ -850,9 +850,9 @@ def test_end_to_end_modules(
     m16.train()
     m32.train()
     train_configs = (
-        [[64, 128, 65, 1]]
+        [[1], [64, 128, 65, 1]]
         if quick
-        else [[64, 128, 65, 1], [1041, 756], [518, 1988, 700, 300]]
+        else [[1], [64, 128, 65, 1], [1041, 756], [518, 1988, 700, 300]]
     )
 
     for seqlens in train_configs:

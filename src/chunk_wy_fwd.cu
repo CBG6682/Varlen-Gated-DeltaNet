@@ -504,6 +504,11 @@ chunk_wy_fwd(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     {
+        at::Tensor k_a = ensure_aligned16(k);
+        at::Tensor v_a = ensure_aligned16(v);
+        at::Tensor b_a = ensure_aligned16(b);
+        at::Tensor w_a = ensure_aligned16(w);
+
         kernel_chunk_wy_fwd<
             Element,
             NUM_THREADS,
@@ -517,10 +522,10 @@ chunk_wy_fwd(
             TiledCopyG2R,
             TiledCopyStore
         ><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const Element*>(k.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(v.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(b.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(w.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(k_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(v_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(b_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(w_a.data_ptr<at::Half>()),
             reinterpret_cast<const Element*>(gamma.data_ptr<at::Half>()),
             reinterpret_cast<const Element*>(a.data_ptr<at::Half>()),
             reinterpret_cast<Element*>(W.data_ptr<at::Half>()),

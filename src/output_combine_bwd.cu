@@ -460,13 +460,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dc_inter_dS
 
             if (row_a < valid_len) {
                 gDcInter[kv_head_offset + chunk_start + row_a] = total_a;
-            } else if (chunk_start + row_a < total_L) {
-                gDcInter[kv_head_offset + chunk_start + row_a] = 0.0f;
             }
             if (row_b < valid_len) {
                 gDcInter[kv_head_offset + chunk_start + row_b] = total_b;
-            } else if (chunk_start + row_b < total_L) {
-                gDcInter[kv_head_offset + chunk_start + row_b] = 0.0f;
             }
         }
     }
@@ -1364,14 +1360,21 @@ output_combine_bwd(
 
     using T = cutlass::half_t;
 
-    const T* p_do        = reinterpret_cast<const T*>(grad_output.data_ptr<at::Half>());
-    const T* p_q         = reinterpret_cast<const T*>(q.data_ptr<at::Half>());
-    const T* p_k         = reinterpret_cast<const T*>(k.data_ptr<at::Half>());
-    const T* p_v         = reinterpret_cast<const T*>(v.data_ptr<at::Half>());
-    const T* p_w         = reinterpret_cast<const T*>(w.data_ptr<at::Half>());
+    at::Tensor grad_output_a = ensure_aligned16(grad_output);
+    at::Tensor q_a           = ensure_aligned16(q);
+    at::Tensor k_a           = ensure_aligned16(k);
+    at::Tensor v_a           = ensure_aligned16(v);
+    at::Tensor w_a           = ensure_aligned16(w);
+    at::Tensor S_a           = ensure_aligned16(S);
+
+    const T* p_do        = reinterpret_cast<const T*>(grad_output_a.data_ptr<at::Half>());
+    const T* p_q         = reinterpret_cast<const T*>(q_a.data_ptr<at::Half>());
+    const T* p_k         = reinterpret_cast<const T*>(k_a.data_ptr<at::Half>());
+    const T* p_v         = reinterpret_cast<const T*>(v_a.data_ptr<at::Half>());
+    const T* p_w         = reinterpret_cast<const T*>(w_a.data_ptr<at::Half>());
     const T* p_gamma     = reinterpret_cast<const T*>(gamma.data_ptr<at::Half>());
     const T* p_alpha     = reinterpret_cast<const T*>(a.data_ptr<at::Half>());
-    const T* p_s         = reinterpret_cast<const T*>(S.data_ptr<at::Half>());
+    const T* p_s         = reinterpret_cast<const T*>(S_a.data_ptr<at::Half>());
     const int32_t* p_vlen    = chunk_valid_lens.data_ptr<int32_t>();
     const int32_t* p_offsets = chunk_offsets.data_ptr<int32_t>();
 

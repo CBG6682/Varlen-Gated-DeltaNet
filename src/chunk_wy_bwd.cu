@@ -783,6 +783,15 @@ chunk_wy_bwd(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     {
+        at::Tensor dW_a     = ensure_aligned16(dW);
+        at::Tensor dY_a     = ensure_aligned16(dY);
+        at::Tensor k_a      = ensure_aligned16(k);
+        at::Tensor v_a      = ensure_aligned16(v);
+        at::Tensor b_a      = ensure_aligned16(b);
+        at::Tensor w_a      = ensure_aligned16(w);
+        at::Tensor dk_ext_a = ensure_aligned16(dk_ext);
+        at::Tensor dv_ext_a = ensure_aligned16(dv_ext);
+
         kernel_chunk_wy_bwd<
             Element,
             NUM_THREADS,
@@ -797,16 +806,16 @@ chunk_wy_bwd(
             TiledCopyG2R,
             TiledCopyStore
         ><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const Element*>(dW.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(dY.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(k.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(v.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(b.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(w.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(dW_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(dY_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(k_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(v_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(b_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(w_a.data_ptr<at::Half>()),
             reinterpret_cast<const Element*>(gamma.data_ptr<at::Half>()),
             reinterpret_cast<const Element*>(a.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(dk_ext.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(dv_ext.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(dk_ext_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(dv_ext_a.data_ptr<at::Half>()),
             da_ext.data_ptr<float>(),
             d_trace.data_ptr<float>(),
             reinterpret_cast<Element*>(dk.data_ptr<at::Half>()),

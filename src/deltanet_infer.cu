@@ -398,13 +398,8 @@ deltanet_infer(
     TORCH_CHECK(a.is_contiguous(), "Tensor 'a' must be contiguous");
     TORCH_CHECK(gamma.is_contiguous(), "Tensor 'gamma' must be contiguous");
 
-    // Enforce 16-byte alignment for 128-bit vectorized uint4 access
+    // Enforce 16-byte alignment for in-place state updates via uint4
     TORCH_CHECK(reinterpret_cast<uintptr_t>(past_state.data_ptr()) % 16 == 0, "Tensor 'past_state' must be 16-byte aligned");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0, "Tensor 'q' must be 16-byte aligned (call .contiguous() after split)");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0, "Tensor 'k' must be 16-byte aligned (call .contiguous() after split)");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(v.data_ptr()) % 16 == 0, "Tensor 'v' must be 16-byte aligned (call .contiguous() after split)");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(b.data_ptr()) % 16 == 0, "Tensor 'b' must be 16-byte aligned (call .contiguous() after split)");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0, "Tensor 'w' must be 16-byte aligned (call .contiguous() after split)");
 
     int64_t B = past_state.size(0);
     int64_t H = num_kv_heads;
@@ -464,11 +459,17 @@ deltanet_infer(
         dim3 grid(H, B);
         dim3 block(NUM_THREADS);
 
-        const Element* p_q     = reinterpret_cast<const Element*>(q.data_ptr<at::Half>());
-        const Element* p_k     = reinterpret_cast<const Element*>(k.data_ptr<at::Half>());
-        const Element* p_v     = reinterpret_cast<const Element*>(v.data_ptr<at::Half>());
-        const Element* p_b     = reinterpret_cast<const Element*>(b.data_ptr<at::Half>());
-        const Element* p_w     = reinterpret_cast<const Element*>(w.data_ptr<at::Half>());
+        at::Tensor q_a = ensure_aligned16(q);
+        at::Tensor k_a = ensure_aligned16(k);
+        at::Tensor v_a = ensure_aligned16(v);
+        at::Tensor b_a = ensure_aligned16(b);
+        at::Tensor w_a = ensure_aligned16(w);
+
+        const Element* p_q     = reinterpret_cast<const Element*>(q_a.data_ptr<at::Half>());
+        const Element* p_k     = reinterpret_cast<const Element*>(k_a.data_ptr<at::Half>());
+        const Element* p_v     = reinterpret_cast<const Element*>(v_a.data_ptr<at::Half>());
+        const Element* p_b     = reinterpret_cast<const Element*>(b_a.data_ptr<at::Half>());
+        const Element* p_w     = reinterpret_cast<const Element*>(w_a.data_ptr<at::Half>());
         const Element* p_a     = reinterpret_cast<const Element*>(a.data_ptr<at::Half>());
         const Element* p_gamma = reinterpret_cast<const Element*>(gamma.data_ptr<at::Half>());
         Element*       p_s     = reinterpret_cast<Element*>(past_state.data_ptr<at::Half>());

@@ -138,6 +138,14 @@ __device__ __forceinline__ OutT half_to_out(__half h) {
     return reinterpret_cast<const OutT&>(h);
 }
 
+// Clone only when a contiguous tensor is not 16-byte aligned for 128-bit uint4 loads.
+inline at::Tensor ensure_aligned16(const at::Tensor& t) {
+    if (t.numel() == 0 || (reinterpret_cast<uintptr_t>(t.data_ptr()) & 15) == 0) {
+        return t;
+    }
+    return t.clone();
+}
+
 inline at::Tensor compute_cu_chunk_lens(
     const at::Tensor& cu_seq_lens,
     int64_t chunk_size = 64

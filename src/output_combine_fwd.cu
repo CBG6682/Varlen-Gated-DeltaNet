@@ -521,6 +521,13 @@ output_combine_fwd(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     {
+        at::Tensor q_a = ensure_aligned16(q);
+        at::Tensor k_a = ensure_aligned16(k);
+        at::Tensor v_a = ensure_aligned16(v);
+        at::Tensor b_a = ensure_aligned16(b);
+        at::Tensor w_a = ensure_aligned16(w);
+        at::Tensor S_a = ensure_aligned16(S);
+
         kernel_output_combine_fwd<
             Element,
             NUM_THREADS,
@@ -534,14 +541,14 @@ output_combine_fwd(
             S2RCopyAtomB_MNMajor,
             TiledCopyG2R
         ><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const Element*>(q.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(k.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(v.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(b.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(w.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(q_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(k_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(v_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(b_a.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(w_a.data_ptr<at::Half>()),
             reinterpret_cast<const Element*>(gamma.data_ptr<at::Half>()),
             reinterpret_cast<const Element*>(a.data_ptr<at::Half>()),
-            reinterpret_cast<const Element*>(S.data_ptr<at::Half>()),
+            reinterpret_cast<const Element*>(S_a.data_ptr<at::Half>()),
             chunk_valid_lens_gpu.data_ptr<int32_t>(),
             chunk_offsets_gpu.data_ptr<int32_t>(),
             reinterpret_cast<Element*>(out.data_ptr<at::Half>()),

@@ -334,7 +334,7 @@ chunk_scan_bwd(
     TORCH_CHECK(S_list.dim() == 4, "S_list must be 4D tensor with shape (num_kv_heads, num_chunks, d_v, d_k)");
     TORCH_CHECK(cu_seq_lens.dim() == 1, "cu_seq_lens must be 1D tensor with shape (batch_size + 1,)");
 
-    const at::Tensor gS = grad_S_list.contiguous();
+    const at::Tensor gS = ensure_aligned16(grad_S_list.contiguous());
     TORCH_CHECK(W.is_contiguous(), "W must be contiguous");
     TORCH_CHECK(S_list.is_contiguous(), "S_list must be contiguous");
 
@@ -376,7 +376,7 @@ chunk_scan_bwd(
         TORCH_CHECK(gf_in.dim() == 4 && gf_in.size(0) == batch_size && gf_in.size(1) == num_kv_heads
                     && gf_in.size(2) == d_v && gf_in.size(3) == d_k,
                     "grad_final_states must be (B, H, d_v, d_k)");
-        grad_final_states_c = gf_in.contiguous();
+        grad_final_states_c = ensure_aligned16(gf_in.contiguous());
         has_grad_final = true;
     }
 
@@ -412,8 +412,9 @@ chunk_scan_bwd(
     {
         using T = cutlass::half_t;
 
+        at::Tensor W_a           = ensure_aligned16(W);
         const T* p_grad_s_list   = reinterpret_cast<const T*>(gS.data_ptr<at::Half>());
-        const T* p_w             = reinterpret_cast<const T*>(W.data_ptr<at::Half>());
+        const T* p_w             = reinterpret_cast<const T*>(W_a.data_ptr<at::Half>());
         const T* p_grad_final    = has_grad_final ? reinterpret_cast<const T*>(grad_final_states_c.data_ptr<at::Half>()) : nullptr;
         const int32_t* p_cu_chunk_lens = cu_chunk_lens_i32.data_ptr<int32_t>();
 

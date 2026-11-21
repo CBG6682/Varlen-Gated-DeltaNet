@@ -366,13 +366,13 @@ chunk_scan_fwd(
         TORCH_CHECK(s_in.dim() == 4 && s_in.size(0) == batch_size && s_in.size(1) == num_kv_heads
                     && s_in.size(2) == d_v && s_in.size(3) == d_k,
                     "state_old must be (B, H, d_v, d_k)");
-        state_old_c = s_in.contiguous();
+        state_old_c = ensure_aligned16(s_in.contiguous());
         use_state_old = true;
     }
 
     auto options = Y.options();
     // Reuse Y memory buffer to store S in-place to minimize peak VRAM
-    at::Tensor S = Y;
+    at::Tensor S = ensure_aligned16(Y);
     at::Tensor final_states;
 
     if (num_chunks == 0 || batch_size == 0) {
@@ -394,7 +394,8 @@ chunk_scan_fwd(
     {
         using T = cutlass::half_t;
 
-        const T* p_w = reinterpret_cast<const T*>(W.data_ptr<at::Half>());
+        at::Tensor W_a = ensure_aligned16(W);
+        const T* p_w = reinterpret_cast<const T*>(W_a.data_ptr<at::Half>());
         T* p_ys = reinterpret_cast<T*>(S.data_ptr<at::Half>());
         const T* p_state_old = use_state_old ? reinterpret_cast<const T*>(state_old_c.data_ptr<at::Half>()) : nullptr;
         const int32_t* p_cu_chunk_lens = cu_chunk_lens_i32.data_ptr<int32_t>();

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 140" width="900" height="140" role="img" aria-label="Varlen-Gated-DeltaNet">
+  <title>Varlen-Gated-DeltaNet</title>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1800" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#76B900"/>
+      <stop offset="0.25" stop-color="#00E676"/>
+      <stop offset="0.5" stop-color="#76B900"/>
+      <stop offset="0.75" stop-color="#00E676"/>
+      <stop offset="1" stop-color="#76B900"/>
+    </linearGradient>
+    <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="900" height="140">
+      <text x="450" y="92" text-anchor="middle" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="63" font-weight="800" fill="#fff">Varlen-Gated-DeltaNet</text>
+    </mask>
+    <style>
+      .sweep { animation: sweep 6s linear infinite; }
+      @keyframes sweep { to { transform: translateX(-900px); } }
+      @media (prefers-reduced-motion: reduce) { .sweep { animation: none; } }
+    </style>
+  </defs>
+  <g mask="url(#m)">
+    <rect class="sweep" x="0" y="0" width="1800" height="140" fill="url(#g)"/>
+  </g>
+</svg>

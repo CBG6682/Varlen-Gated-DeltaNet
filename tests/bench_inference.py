@@ -88,6 +88,24 @@ def _compile_or_none(target: Any, label: str):
         return None
 
 
+class _RefInferModule(torch.nn.Module):
+    """Pure-PyTorch wrapper so torch.compile traces only the eager reference path."""
+
+    def __init__(self, block: DeltaBlock) -> None:
+        super().__init__()
+        self.block = block
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_states: Optional[torch.Tensor] = None,
+        conv_state: Optional[torch.Tensor] = None,
+    ):
+        return self.block(
+            x, past_states=past_states, conv_state=conv_state, use_kernel=False
+        )
+
+
 def run_inference_benchmark(
     d_model: int = 768,
     num_q_heads: int = 8,
@@ -97,42 +115,46 @@ def run_inference_benchmark(
     batch_sizes: Optional[List[int]] = None,
     num_warmup: int = 5,
     num_iters: int = 20,
-    use_short_conv: bool = False,
+    use_short_conv: bool = True,
     include_compile: bool = True,
+    include_external: bool = True,
     dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
 ):
-    """Part A: Benchmark pure token-mixer decode step (L = 1) across batch sizes."""
+    """Part A: Benchmark pure token-mixer decode step (L=1): PyTorch eager & compiled first, then optional FLA/NVLabs."""
     device = device or get_device()
     batch_sizes = batch_sizes or [1, 16, 64, 256, 1024, 2048]
 
     print_section("PART A: AUTOREGRESSIVE DECODE (L = 1, PURE TOKEN MIXER VS BASELINES)")
     print(
         f"Config: d_model={d_model}, H_q={num_q_heads}, H_kv={num_kv_heads}, "
-        f"d_k={d_k}, d_v={d_v}, dtype={dtype}, device={device}"
+        f"d_k={d_k}, d_v={d_v}, conv={use_short_conv}, dtype={dtype}, device={device}"
     )
 
     our_block = DeltaBlock(
         d_model=d_model, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
         d_k=d_k, d_v=d_v, hidden_dim=None,
     ).to(device=device, dtype=dtype).eval()
-    our_compiled = _compile_or_none(our_block, "DeltaBlock-infer") if include_compile else None
+    ref_wrapper = _RefInferModule(our_block)
+    ref_compiled = _compile_or_none(ref_wrapper, "PyTorch-Ref-Infer") if include_compile else None
 
-    fla_cache_cls = try_import_fla_cache()
-    baselines = [
-        ("FLA GatedDeltaNet (v1)", _try_init_infer_baseline(
-            try_import_fla_gdn(), "FLA GatedDeltaNet (v1)",
-            d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
-        )),
-        ("FLA GatedDeltaNet-2", _try_init_infer_baseline(
-            try_import_fla_gdn2(), "FLA GatedDeltaNet-2",
-            d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
-        )),
-        ("NVLabs GatedDeltaNet-2", _try_init_infer_baseline(
-            try_import_nvlabs_gdn2(), "NVLabs GatedDeltaNet-2",
-            d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
-        )),
-    ]
+    fla_cache_cls = try_import_fla_cache() if include_external else None
+    baselines = []
+    if include_external:
+        baselines = [
+            ("FLA GatedDeltaNet (v1)", _try_init_infer_baseline(
+                try_import_fla_gdn(), "FLA GatedDeltaNet (v1)",
+                d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
+            )),
+            ("FLA GatedDeltaNet-2", _try_init_infer_baseline(
+                try_import_fla_gdn2(), "FLA GatedDeltaNet-2",
+                d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
+            )),
+            ("NVLabs GatedDeltaNet-2", _try_init_infer_baseline(
+                try_import_nvlabs_gdn2(), "NVLabs GatedDeltaNet-2",
+                d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
+            )),
+        ]
 
     headers = [
         "Batch (B)", "Method / Implementation", "Latency (ms)", "Throughput (tok/s)",
@@ -142,25 +164,27 @@ def run_inference_benchmark(
     records: List[Dict[str, Any]] = []
 
     dtype_bytes = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    d_qkv = num_q_heads * d_k + num_kv_heads * (d_k + d_v)
 
     for B in tqdm(batch_sizes, desc="Inference (Part A)", unit="batch"):
         print(f"\n---> Benchmarking Batch Size B = {B} (L = 1) ...", flush=True)
         gflops = compute_deltanet_inference_flops(
             batch_size=B, d_model=d_model, num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads, d_k=d_k, d_v=d_v,
+            num_kv_heads=num_kv_heads, d_k=d_k, d_v=d_v, conv_size=4,
         ) / 1e9
         total_bytes = compute_deltanet_inference_memory_bytes(
             batch_size=B, d_model=d_model, num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads, d_k=d_k, d_v=d_v,
-            dtype_bytes=dtype_bytes, state_bytes=2,
+            num_kv_heads=num_kv_heads, d_k=d_k, d_v=d_v, conv_size=4,
+            dtype_bytes=dtype_bytes, state_bytes=4,
         )
 
         x_step = torch.randn(B, 1, d_model, device=device, dtype=dtype)
-        past_state = torch.zeros(B, num_kv_heads, d_v, d_k, device=device, dtype=torch.float16)
+        past_state = torch.zeros(B, num_kv_heads, d_v, d_k, device=device, dtype=torch.float32)
+        conv_state = torch.zeros(B, 3, d_qkv, device=device, dtype=torch.float16)
 
         def _run_ref():
             with torch.no_grad():
-                return our_block(x_step, past_states=past_state, use_kernel=False)
+                return our_block(x_step, past_states=past_state, conv_state=conv_state, use_kernel=False)
 
         res_ref = measure_performance(_run_ref, num_warmup, num_iters, device)
         ref_lat = res_ref["latency_ms"] if res_ref["status"] == "OK" else 0.0
@@ -199,6 +223,22 @@ def run_inference_benchmark(
 
         _append_result("PyTorch Reference (Unfused)", res_ref)
 
+        if ref_compiled is not None:
+            def _run_ref_comp():
+                with torch.no_grad():
+                    return ref_compiled(x_step, past_state, conv_state)
+
+            _append_result(
+                "PyTorch Reference (Compiled)",
+                measure_performance(_run_ref_comp, num_warmup, num_iters, device),
+            )
+
+        def _run_ours():
+            with torch.no_grad():
+                return our_block(x_step, past_states=past_state, conv_state=conv_state, use_kernel=True)
+
+        _append_result("DeltaNet v2 (Ours)", measure_performance(_run_ours, num_warmup, num_iters, device), bold=True)
+
         for bname, bmod in baselines:
             if bmod is None:
                 continue
@@ -210,24 +250,7 @@ def run_inference_benchmark(
 
             _append_result(bname, measure_performance(_run_base, num_warmup, num_iters, device))
 
-        def _run_ours():
-            with torch.no_grad():
-                return our_block(x_step, past_states=past_state, use_kernel=True)
-
-        _append_result("DeltaNet v2 (Ours)", measure_performance(_run_ours, num_warmup, num_iters, device), bold=True)
-
-        if our_compiled is not None:
-            def _run_ours_comp():
-                with torch.no_grad():
-                    return our_compiled(x_step, past_states=past_state, use_kernel=True)
-
-            _append_result(
-                "DeltaNet v2 (Compiled)",
-                measure_performance(_run_ours_comp, num_warmup, num_iters, device),
-                bold=True,
-            )
-
-        del x_step, past_state
+        del x_step, past_state, conv_state
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -252,10 +275,11 @@ def run_e2e_inference_benchmark(
     gen_steps: int = 32,
     num_warmup: int = 4,
     num_iters: int = 12,
+    include_compile: bool = True,
     dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
 ):
-    """Part B: End-to-End DeltaBlock (with MLP) decode L=1 and prefill+decode rollout."""
+    """Part B: End-to-End DeltaBlock (PreNorm + SwiGLU MLP) decode L=1 and prefill+decode rollout."""
     device = device or get_device()
     decode_batches = decode_batches or [16, 64, 256, 1024]
     hidden_dim = d_model * 4
@@ -272,10 +296,12 @@ def run_e2e_inference_benchmark(
 
     modes = [
         ("torch-eager", False, False),
-        ("torch-compiled", False, True),
-        ("kernel-eager", True, False),
-        ("kernel-compiled", True, True),
     ]
+    if include_compile:
+        modes.append(("torch-compiled", False, True))
+    modes.append(("kernel", True, False))
+
+    d_qkv = num_q_heads * d_k + num_kv_heads * (d_k + d_v)
 
     for B in decode_batches:
         for mname, use_k, do_comp in modes:
@@ -285,7 +311,7 @@ def run_e2e_inference_benchmark(
                 d_model=d_model, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
                 d_k=d_k, d_v=d_v, chunk_size=chunk_size, hidden_dim=hidden_dim,
             ).to(device=device, dtype=dtype).eval()
-            fn = _compile_or_none(blk, mname) if do_comp else blk
+            fn = _compile_or_none(_RefInferModule(blk), mname) if do_comp else blk
             if fn is None:
                 rows.append([B, mname, "COMPILE_ERR", "-", "-", "-"])
                 records.append({"B": B, "mode": mname, "dec_ms": None, "tok_s": None, "e2e_ms": None, "peak_mb": None, "status": "COMPILE_ERR"})
@@ -293,15 +319,18 @@ def run_e2e_inference_benchmark(
                 continue
 
             x_dec = torch.randn(B, 1, d_model, device=device, dtype=dtype)
-            past = torch.zeros(B, num_kv_heads, d_v, d_k, device=device, dtype=torch.float16)
+            past = torch.zeros(B, num_kv_heads, d_v, d_k, device=device, dtype=torch.float32)
+            conv_s = torch.zeros(B, 3, d_qkv, device=device, dtype=torch.float16)
 
             def _dec_step():
                 with torch.no_grad():
-                    return fn(x_dec, past_states=past, use_kernel=use_k)
+                    if do_comp:
+                        return fn(x_dec, past, conv_s)
+                    return fn(x_dec, past_states=past, conv_state=conv_s, use_kernel=use_k)
 
             res_dec = measure_performance(_dec_step, num_warmup, num_iters, device)
 
-            # E2E Prefill + gen_steps rollout on compact batch <= 256 to avoid excessive Colab OOM
+            # E2E Prefill + gen_steps rollout on compact batch <= 256 to avoid Colab OOM
             res_e2e_ms: Optional[float] = None
             peak_e2e_mb = res_dec["peak_alloc_mb"]
             if B <= 256 and res_dec["status"] == "OK":
@@ -312,12 +341,18 @@ def run_e2e_inference_benchmark(
 
                 def _e2e_run():
                     with torch.no_grad():
-                        if use_k:
-                            _, st = fn(x_pre_var, cu_seqlens=cu_pre, use_kernel=True)
+                        if do_comp:
+                            _, st, cs = fn(x_pre_pad, None, None)
+                            for t in range(gen_steps):
+                                _, st, cs = fn(x_roll[:, t], st, cs)
+                        elif use_k:
+                            _, st, cs = fn(x_pre_var, cu_seqlens=cu_pre, use_kernel=True)
+                            for t in range(gen_steps):
+                                _, st, cs = fn(x_roll[:, t], past_states=st, conv_state=cs, use_kernel=True)
                         else:
-                            _, st = fn(x_pre_pad, use_kernel=False)
-                        for t in range(gen_steps):
-                            _, st = fn(x_roll[:, t], past_states=st, use_kernel=use_k)
+                            _, st, cs = fn(x_pre_pad, use_kernel=False)
+                            for t in range(gen_steps):
+                                _, st, cs = fn(x_roll[:, t], past_states=st, conv_state=cs, use_kernel=False)
                         return st
 
                 r_e2e = measure_performance(_e2e_run, max(2, num_warmup // 2), max(4, num_iters // 3), device)
@@ -331,7 +366,7 @@ def run_e2e_inference_benchmark(
                 tok_s = (B * 1000.0) / dec_ms if dec_ms > 0 else 0.0
                 e2e_str = f"{res_e2e_ms:.2f}" if res_e2e_ms is not None else "-"
                 print(f"  [B={B}] {mname:<15}: decode={dec_ms:.3f}ms ({tok_s:,.0f} tok/s) | E2E={e2e_str}ms | VRAM={peak_e2e_mb:.0f}MB")
-                bold = (mname == "kernel-compiled")
+                bold = (mname == "kernel")
                 w = (lambda s: f"**{s}**") if bold else (lambda s: s)
                 rows.append([B, w(mname), w(f"{dec_ms:.3f}"), w(f"{tok_s:,.0f}"), w(e2e_str), w(f"{peak_e2e_mb:.1f}")])
                 records.append({
@@ -346,7 +381,7 @@ def run_e2e_inference_benchmark(
                     "e2e_ms": None, "peak_mb": None, "status": res_dec["status"],
                 })
 
-            del x_dec, past, blk, fn
+            del x_dec, past, conv_s, blk, fn
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -374,11 +409,11 @@ def _save_inference_plot(
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     methods = [
         ("PyTorch Reference (Unfused)", "#6c757d"),
+        ("PyTorch Reference (Compiled)", "#0ea5e9"),
         ("FLA GatedDeltaNet (v1)", "#3b82f6"),
         ("FLA GatedDeltaNet-2", "#8b5cf6"),
         ("NVLabs GatedDeltaNet-2", "#f59e0b"),
         ("DeltaNet v2 (Ours)", "#10b981"),
-        ("DeltaNet v2 (Compiled)", "#047857"),
     ]
     active_methods = [(m, c) for m, c in methods if any(r["method"] == m and r["status"] == "OK" for r in part_a)]
     batches_a = sorted({r["batch_size"] for r in part_a})
@@ -387,13 +422,13 @@ def _save_inference_plot(
     nrows = 2 if part_b else 1
     fig, axes = plt.subplots(nrows, ncols, figsize=(15, 5.2 * nrows))
     axes_2d = axes.reshape(nrows, ncols)
-    fig.suptitle("DeltaNet v2 Inference Benchmark (NVIDIA Turing SM75, FP16)", fontsize=13, fontweight="bold")
+    fig.suptitle("Gated DeltaNet-2 Inference Benchmark (NVIDIA Turing SM75, FP16)", fontsize=13, fontweight="bold")
 
     ax1 = axes_2d[0, 0]
     ax2 = axes_2d[0, 1]
     bx_labels = [str(b) for b in batches_a]
     for m, color in active_methods:
-        lw = 2.4 if "Ours" in m or "Compiled" in m else 1.5
+        lw = 2.4 if "Ours" in m else 1.6
         toks = [next((r["throughput_tok_s"] for r in part_a if r["batch_size"] == b and r["method"] == m), None) for b in batches_a]
         lats = [next((r["latency_ms"] for r in part_a if r["batch_size"] == b and r["method"] == m), None) for b in batches_a]
         if any(v is not None for v in toks):
@@ -418,15 +453,15 @@ def _save_inference_plot(
         e2e_modes = [
             ("torch-eager", "#6c757d"),
             ("torch-compiled", "#3b82f6"),
-            ("kernel-eager", "#f59e0b"),
-            ("kernel-compiled", "#10b981"),
+            ("kernel", "#10b981"),
         ]
+        active_e2e = [(m, c) for m, c in e2e_modes if any(r["mode"] == m and r["status"] == "OK" for r in part_b)]
         ax3 = axes_2d[1, 0]
         ax4 = axes_2d[1, 1]
 
-        for m, color in e2e_modes:
+        for m, color in active_e2e:
             toks = [next((r["tok_s"] or 0.0 for r in part_b if r["B"] == b and r["mode"] == m), 0.0) for b in batches_b]
-            ax3.plot([str(b) for b in batches_b], toks, marker="o", linewidth=2.2 if "kernel" in m else 1.5, label=m, color=color)
+            ax3.plot([str(b) for b in batches_b], toks, marker="o", linewidth=2.2 if m == "kernel" else 1.5, label=m, color=color)
 
         ax3.set_title("Part B: E2E DeltaBlock Decode Throughput (L=1)")
         ax3.set_xlabel("Batch Size (B)")
@@ -435,11 +470,12 @@ def _save_inference_plot(
         ax3.legend(fontsize=8)
 
         e2e_batches = [b for b in batches_b if any(r["B"] == b and r.get("e2e_ms") is not None for r in part_b)]
-        if e2e_batches:
+        if e2e_batches and active_e2e:
             xb = np.arange(len(e2e_batches))
-            wb = 0.19
-            for idx, (m, color) in enumerate(e2e_modes):
-                offs = xb + (idx - 1.5) * wb
+            n_e = len(active_e2e)
+            wb = 0.72 / n_e
+            for idx, (m, color) in enumerate(active_e2e):
+                offs = xb + (idx - (n_e - 1) / 2.0) * wb
                 e2e_vals = [next((r["e2e_ms"] or 0.0 for r in part_b if r["B"] == b and r["mode"] == m), 0.0) for b in e2e_batches]
                 ax4.bar(offs, e2e_vals, width=wb, label=m, color=color)
             ax4.set_xticks(xb)
@@ -468,9 +504,10 @@ def parse_args():
     parser.add_argument("--gen-steps", type=int, default=32, help="Generation steps for Part B E2E rollout")
     parser.add_argument("--warmup", type=int, default=5, help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=20, help="Number of timed iterations")
-    parser.add_argument("--use-conv", action="store_true", help="Enable ShortConvolution in baselines")
+    parser.add_argument("--no-conv", action="store_true", help="Disable ShortConvolution in external baselines")
+    parser.add_argument("--skip-external", action="store_true", help="Only run fast PyTorch eager + torch.compile vs Ours (skip slow FLA/NVLabs)")
     parser.add_argument("--skip-e2e", action="store_true", help="Skip Part B E2E DeltaBlock benchmark")
-    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile variants")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile baselines")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 instead of float16")
     parser.add_argument("--save-md", type=str, default=None, help="Save markdown tables to file")
     parser.add_argument("--save-json", type=str, default=None, help="Save benchmark results as JSON")
@@ -481,7 +518,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     print_hardware_info()
-    print_baseline_status()
+    if not args.skip_external:
+        print_baseline_status()
 
     b_list = [int(b.strip()) for b in args.batches.split(",") if b.strip()]
     e2e_b_list = [int(b.strip()) for b in args.e2e_batches.split(",") if b.strip()]
@@ -490,8 +528,10 @@ if __name__ == "__main__":
     part_a_rec, part_a_md = run_inference_benchmark(
         d_model=args.dim, num_q_heads=args.q_heads, num_kv_heads=args.kv_heads,
         d_k=args.d_k, d_v=args.d_v, batch_sizes=b_list, num_warmup=args.warmup,
-        num_iters=args.iters, use_short_conv=args.use_conv,
-        include_compile=not args.no_compile, dtype=dtype,
+        num_iters=args.iters, use_short_conv=not args.no_conv,
+        include_compile=not args.no_compile,
+        include_external=not args.skip_external,
+        dtype=dtype,
     )
 
     part_b_rec, part_b_md = None, ""
@@ -501,7 +541,8 @@ if __name__ == "__main__":
             d_model=args.dim, num_q_heads=args.q_heads, num_kv_heads=e2e_hkv,
             d_k=args.d_k, d_v=args.d_v, decode_batches=e2e_b_list,
             prefill_len=args.prefill_len, gen_steps=args.gen_steps,
-            num_warmup=args.warmup, num_iters=max(8, args.iters), dtype=dtype,
+            num_warmup=args.warmup, num_iters=max(8, args.iters),
+            include_compile=not args.no_compile, dtype=dtype,
         )
 
     if args.save_md:

@@ -353,34 +353,52 @@ def compute_deltanet_training_flops(
     d_k: int = 64,
     d_v: int = 64,
     chunk_size: int = 64,
+    conv_size: int = 4,
 ) -> float:
     """
     Theoretical floating-point operations (FLOPs) for a full Forward + Backward
-    training step of the pure Gated DeltaNet token mixer (excluding MLP/FFW).
+    training step of the pure Gated DeltaNet-2 token mixer (excluding MLP/FFW).
 
+    Includes unified W_proj (q, k, v, b, w, f_gate, o_gate), causal depthwise
+    ShortConv1D, chunk WY/T-solve, inter-chunk scan, intra+inter output combine,
+    per-head RMSNorm * SiLU(o_gate), and W_out.
     FLOPs_total = 3 * FLOPs_fwd (Forward + Backward gradients w.r.t inputs & weights).
     """
     T = batch_size * seq_len
-    num_chunks = max(seq_len // chunk_size, 1)
+    num_chunks = max((seq_len + chunk_size - 1) // chunk_size, 1)
+
+    d_q = num_q_heads * d_k
+    d_k_tot = num_kv_heads * d_k
+    d_v_tot = num_kv_heads * d_v
+    d_out_tot = num_q_heads * d_v
+    d_qkv = d_q + d_k_tot + d_v_tot
 
     # Input projection: [T, d_model] -> [T, d_proj_out]
-    # q, k, v, w, b, alpha, gamma
-    d_proj_out = num_q_heads * d_k + num_kv_heads * (d_k + 2 * d_v + d_k + 2)
+    # Slices: q (Hq*d_k), k (H*d_k), v (H*d_v), b (H*d_k), w (H*d_v), f_gate (H*d_k), o_gate (Hq*d_v)
+    d_proj_out = d_q + 3 * d_k_tot + 2 * d_v_tot + d_out_tot
 
     fwd_proj = 2.0 * T * d_model * d_proj_out
-    fwd_gate = 2.0 * T * d_model * (num_q_heads * d_v)
-    fwd_out_proj = 2.0 * T * (num_q_heads * d_v) * d_model
+    fwd_conv = 2.0 * T * conv_size * d_qkv if conv_size > 0 else 0.0
+    fwd_out_proj = 2.0 * T * d_out_tot * d_model
 
-    # Chunk WY recurrence
-    fwd_wy = 2.0 * T * num_kv_heads * (d_k * d_k + d_v * d_k)
-    fwd_scan = 2.0 * batch_size * num_chunks * num_kv_heads * d_v * d_k * d_k
-    fwd_intra_attn = 2.0 * T * num_kv_heads * chunk_size * (d_k + d_v)
+    # Chunk WY + T-solve:
+    # B_eff@K^T [C,C], (I+T)^-1 triangular solve (~2/3 C^3), A@B_eff -> Y [C,d_k], A@W -> U [C,d_v]
+    fwd_t_solve = num_kv_heads * batch_size * num_chunks * (
+        2.0 * chunk_size * chunk_size * d_k + (2.0 / 3.0) * (chunk_size ** 3)
+    )
+    fwd_wy = 2.0 * T * num_kv_heads * chunk_size * (d_k + d_v)
+
+    # Inter-chunk scan: S@Y [d_v,C], U - S@Y -> R, S_next = decay*S + R^T@K
+    fwd_scan = 4.0 * batch_size * num_chunks * num_kv_heads * chunk_size * d_v * d_k
+
+    # Output combine: S@Q^T (inter), Q@K^T (intra), Attn@R (intra)
     fwd_inter_attn = 2.0 * T * num_q_heads * d_k * d_v
+    fwd_intra_attn = 2.0 * T * num_q_heads * chunk_size * (d_k + d_v)
 
-    fwd_elementwise = 10.0 * T * d_model
+    fwd_elementwise = 12.0 * T * d_model
     fwd_flops = (
-        fwd_proj + fwd_gate + fwd_out_proj
-        + fwd_wy + fwd_scan + fwd_intra_attn + fwd_inter_attn
+        fwd_proj + fwd_conv + fwd_out_proj
+        + fwd_t_solve + fwd_wy + fwd_scan + fwd_intra_attn + fwd_inter_attn
         + fwd_elementwise
     )
     return 3.0 * fwd_flops
@@ -393,42 +411,41 @@ def compute_deltanet_inference_flops(
     num_kv_heads: int = 8,
     d_k: int = 64,
     d_v: int = 64,
+    conv_size: int = 4,
 ) -> float:
     """
     Theoretical floating-point operations (FLOPs) for single-step autoregressive decode (L = 1)
-    of the pure Gated DeltaNet token mixer block (excluding MLP/FFW).
+    of the pure Gated DeltaNet-2 token mixer block (excluding MLP/FFW).
     """
     B = batch_size
     Hq = num_q_heads
     H = num_kv_heads
-    G = max(Hq // H, 1)
+    d_q = Hq * d_k
+    d_k_tot = H * d_k
+    d_v_tot = H * d_v
     d_out_total = Hq * d_v
+    d_qkv = d_q + d_k_tot + d_v_tot
 
-    # Projections:
-    # W_proj: q (Hq*d_k), k (H*d_k), v (H*d_v), b (H*d_k), w (H*d_v), alpha (H), gamma (H)
-    d_proj_out = Hq * d_k + H * (d_k + 2 * d_v + d_k + 2)
+    # Unified W_proj: q (Hq*d_k), k (H*d_k), v (H*d_v), b (H*d_k), w (H*d_v), f_gate (H*d_k), o_gate (Hq*d_v)
+    d_proj_out = d_q + 3 * d_k_tot + 2 * d_v_tot + d_out_total
     flops_proj = 2.0 * B * d_model * d_proj_out
-    flops_gate = 2.0 * B * d_model * d_out_total
+    flops_conv = 2.0 * B * conv_size * d_qkv if conv_size > 0 else 0.0
     flops_out = 2.0 * B * d_out_total * d_model
 
-    # Recurrence update per step:
-    # S * q^T: [B, H, G, d_v]
-    flops_q_S = 2.0 * B * Hq * d_v * d_k
-    # S * u: [B, H, d_v]
-    flops_S_u = 2.0 * B * H * d_v * d_k
-    # q * k^T: [B, H, G]
-    flops_q_k = 2.0 * B * Hq * d_k
-    # attn * v_new: [B, H, G, d_v]
-    flops_attn_v = 2.0 * B * Hq * d_v
-    # State update: alpha * S + (v_new - S_u) * k^T
-    flops_state_update = 2.0 * B * H * d_v * d_k + 2.0 * B * H * d_v * d_k
+    # Recurrence update per step (GDN-2):
+    # S_decayed * b_eff: [B, H, d_v]
+    flops_S_beff = 2.0 * B * H * d_v * d_k
+    # State update: S = alpha_vec * S + r * k^T -> [B, H, d_v, d_k]
+    flops_state_update = 3.0 * B * H * d_v * d_k
+    # Readout: S_next * q -> [B, H, G, d_v]
+    flops_S_q = 2.0 * B * Hq * d_v * d_k
 
-    # Elementwise ops (RMSNorm, silu, activations)
-    flops_elem = 10.0 * B * d_model
+    # Elementwise ops (SiLU, L2 norm, channel-wise decay exp/softplus, per-head RMSNorm, o_gate)
+    flops_elem = 12.0 * B * d_model
 
     return (
-        flops_proj + flops_gate + flops_out
-        + flops_q_S + flops_S_u + flops_q_k + flops_attn_v + flops_state_update
+        flops_proj + flops_conv + flops_out
+        + flops_S_beff + flops_state_update + flops_S_q
         + flops_elem
     )
 
@@ -440,39 +457,46 @@ def compute_deltanet_inference_memory_bytes(
     num_kv_heads: int = 8,
     d_k: int = 64,
     d_v: int = 64,
+    conv_size: int = 4,
     dtype_bytes: int = 2,
-    state_bytes: int = 2,
+    state_bytes: int = 4,
 ) -> float:
     """
-    Theoretical minimum bytes transferred from DRAM (weights, activations, recurrent state)
-    during a single autoregressive decode step (L = 1).
+    Theoretical minimum bytes transferred from DRAM (weights, activations,
+    FP32 recurrent state, and FP16 conv_state) during a single autoregressive
+    decode step (L = 1) of the pure GDN-2 token mixer.
     """
     B = batch_size
     Hq = num_q_heads
     H = num_kv_heads
+    d_q = Hq * d_k
+    d_k_tot = H * d_k
+    d_v_tot = H * d_v
     d_out_total = Hq * d_v
-    d_proj_out = Hq * d_k + H * (d_k + 2 * d_v + d_k + 2)
+    d_qkv = d_q + d_k_tot + d_v_tot
+    d_proj_out = d_q + 3 * d_k_tot + 2 * d_v_tot + d_out_total
 
     # 1. Static weights (read once per step across all batch items)
-    # W_proj, W_gate, W_out, rms_norm
-    weights_elems = (
+    # W_proj (FP16), conv_weight (FP16), o_norm_weight (FP16), W_out (FP16) + A_log, dt_bias (FP32)
+    weights_fp16_elems = (
         d_model * d_proj_out       # W_proj
-        + d_model * d_out_total    # W_gate
+        + conv_size * d_qkv        # conv_weight
+        + d_v                      # o_norm_weight (per-head)
         + d_out_total * d_model    # W_out
-        + d_out_total              # RMSNorm weight
     )
-    weights_bytes = weights_elems * dtype_bytes
+    weights_fp32_elems = H + d_k_tot  # A_log + dt_bias
+    weights_bytes = weights_fp16_elems * dtype_bytes + weights_fp32_elems * 4
 
-    # 2. Input and output activations
-    # Read x, write y
+    # 2. Input and output activations (read x, write y)
     act_bytes = 2.0 * B * d_model * dtype_bytes
 
-    # 3. Recurrent state memory traffic (KV cache equivalent)
-    # Read past_states [B, H, d_v, d_k], write next_states [B, H, d_v, d_k]
+    # 3. Recurrent state memory traffic (FP32 state read+write) + ShortConv cache (FP16 read+write)
     state_elems = 2.0 * B * H * d_v * d_k
     state_traffic_bytes = state_elems * state_bytes
+    conv_state_elems = 2.0 * B * max(conv_size - 1, 0) * d_qkv if conv_size > 1 else 0.0
+    conv_state_bytes = conv_state_elems * dtype_bytes
 
-    return float(weights_bytes + act_bytes + state_traffic_bytes)
+    return float(weights_bytes + act_bytes + state_traffic_bytes + conv_state_bytes)
 
 
 # =========================================================================

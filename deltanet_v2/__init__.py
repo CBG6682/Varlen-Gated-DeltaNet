@@ -1,13 +1,12 @@
 """
-DeltaNet v2: High-Performance Linear Attention CUDA Kernels & PyTorch Module.
+DeltaNet v2: High-Performance Gated DeltaNet-2 CUDA Kernels & PyTorch Module.
 
 Engineered with NVIDIA CUTLASS / CuTe specifically targeting Turing SM75 (Tesla T4).
 """
 
 import os
-import sys
 
-# Extend package __path__ to also include installed site-packages/dist-packages paths
+# Extend package __path__ to include installed site-packages/dist-packages paths
 # when running from a local checkout, allowing discovery of compiled C-extensions (_C*.so).
 try:
     import site
@@ -22,7 +21,7 @@ except Exception:
     pass
 
 from deltanet_v2.ops import (
-    DeltaBlockKernelFn,
+    FullDeltaBlockFn,
     apply_deltablock,
     apply_deltablock_infer,
     custom_ops,
@@ -32,7 +31,7 @@ from deltanet_v2.model import DeltaBlock
 __version__ = "2.0.0"
 __all__ = [
     "DeltaBlock",
-    "DeltaBlockKernelFn",
+    "FullDeltaBlockFn",
     "apply_deltablock",
     "apply_deltablock_infer",
     "custom_ops",

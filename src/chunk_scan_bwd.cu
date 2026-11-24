@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <optional>
 #include <tuple>
-#include <vector>
 
 #include <cute/tensor.hpp>
 #include <cute/algorithm/copy.hpp>
@@ -23,457 +22,559 @@
 
 using namespace cute;
 
-// Chunk scan backward kernel computing grad_W, grad_Y, and grad_state_old.
+// ============================================================================
+// Part 1: Global Kernel (kernel_chunk_scan_bwd)
+// ============================================================================
+
 template <
     typename T,
     int NUM_THREADS,
+    int CHUNK_SIZE,
     int D_K,
     int D_V,
     int B_V,
     typename MMAAtom,
-    typename TiledMMAType,
-    typename S2RCopyAtomA,
-    typename S2RCopyAtomB,
-    typename TiledCopyG2R,
-    typename TiledCopyStore
+    typename TiledMMA411,
+    typename TiledMMA141,
+    typename S2RCopyAtomA_KM,
+    typename S2RCopyAtomB_KM,
+    typename S2RCopyAtomA_MNM,
+    typename S2RCopyAtomB_MNM,
+    typename TiledCopyHalf,
+    typename TiledCopyR,
+    typename TiledCopyFloat
 >
 __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_bwd(
-    const T* __restrict__ gGradSList,          // (num_kv_heads, num_chunks, d_v, d_k) [FP16]
-    const T* __restrict__ gW,                  // (num_kv_heads, num_chunks, d_k, d_k) [FP16]
-    const T* __restrict__ gGradFinalStates,    // (batch_size, num_kv_heads, d_v, d_k) [FP16] (nullable)
-    const int32_t* __restrict__ cu_chunk_lens, // (batch_size + 1,) [Int32]
-    T* __restrict__ gGradY,                    // (num_kv_heads, num_chunks, d_v, d_k) [FP16]
-    T* __restrict__ gGradStateOld,             // (batch_size, num_kv_heads, d_v, d_k) [FP16] (nullable)
-    bool has_state_old,                        // scalar [bool]
-    int64_t num_chunks,                        // scalar [int64]
-    int64_t batch_size                         // scalar [int64]
+    float*                      gDS_inout,        // (H_kv, num_chunks, 64, 64) [FP32] - In: dS_out, Out in-place: dS_next
+    T*                          gDR_inout,        // (H_kv, num_chunks, 64, 64) [FP16] - In: dR_out, Out in-place: dR_total
+    const T*       __restrict__ gY,               // (H_kv, num_chunks, 64, 64) [FP16] - Erase WY auxiliary
+    const T*       __restrict__ gK_h,             // (H_kv, total_L, 64) [FP16] - Normalized Key
+    const float*   __restrict__ gG_log2_h,        // (H_kv, total_L, 64) [FP32] - Chunk cumsum log2 decay
+    const float*   __restrict__ gGradFinalStates, // (B, H_kv, 64, 64) [FP32] - Incoming gradient at final state (nullable)
+    const int32_t* __restrict__ cu_chunk_lens,    // (B + 1,) [Int32] - Cumulative chunk offsets
+    const int32_t* __restrict__ chunk_offsets,    // (num_chunks + 1,) [Int32] - Chunk token starts
+    const int32_t* __restrict__ chunk_valid_lens, // (num_chunks,) [Int32] - Valid tokens per chunk
+    float*         __restrict__ gGradStateOld,    // (B, H_kv, 64, 64) [FP32] - Initial state gradient (nullable)
+    bool    has_state_old,                        // scalar [bool] - Emit gGradStateOld when true
+    int64_t total_L,                              // scalar [int64] - Total packed tokens
+    int64_t num_chunks                            // scalar [int64] - Total varlen chunks
 ) {
-    // Stage 1 - Setup & Grid Initialization
+    // 1. Setup & SMEM Layouts (16.0 KB <= 32 KB)
     int batch_idx = blockIdx.x;
     int head_idx  = blockIdx.y;
-    int v_idx     = blockIdx.z; // V slice index: 0 .. (D_V / B_V - 1)
+    int v_idx     = blockIdx.z;
     int tid       = threadIdx.x;
+
+    int row_id   = tid / 8;
+    int col_base = (tid % 8) * 8;
 
     int32_t start_c = cu_chunk_lens[batch_idx];
     int32_t end_c   = cu_chunk_lens[batch_idx + 1];
 
-    int64_t mat_elements_v = (int64_t)D_V * D_K;
-    int64_t mat_elements_k = (int64_t)D_K * D_K;
+    int64_t mat_elements_vk = static_cast<int64_t>(D_V) * D_K;
+    int64_t mat_elements_ck = static_cast<int64_t>(CHUNK_SIZE) * D_K;
+    int64_t mat_elements_cv = static_cast<int64_t>(CHUNK_SIZE) * D_V;
+    int64_t slice_offset_v  = static_cast<int64_t>(v_idx) * B_V * D_K;
+    int64_t state_offset    = (static_cast<int64_t>(batch_idx) * gridDim.y + head_idx) * mat_elements_vk + slice_offset_v;
+    int64_t head_tok_base   = static_cast<int64_t>(head_idx) * total_L;
 
-    int64_t slice_offset_v = (int64_t)v_idx * B_V * D_K;
-    int64_t state_offset   = ((int64_t)batch_idx * gridDim.y + head_idx) * mat_elements_v + slice_offset_v;
+    __shared__ alignas(16) float sDeltaS_f32[B_V * D_K]; // 4 KB
+    __shared__ alignas(16) T     sDeltaS_f16[B_V * D_K]; // 2 KB
+    __shared__ alignas(16) T     sMat[CHUNK_SIZE * D_K]; // 8 KB
+    __shared__ alignas(16) T     sDR[CHUNK_SIZE * B_V];  // 2 KB
 
-    // Stage 2 - Shared Memory Allocation & CuTe Layouts
-    // Compact 10 KB SMEM: sDeltaS (2 KB), sW (8 KB, aliased as sDeltaS_accum)
-    __shared__ alignas(16) T sDeltaS[B_V * D_K]; // 2 KB: Delta_S accumulator for slice (16 x 64)
-    __shared__ alignas(16) T sW[D_K * D_K];      // 8 KB: full W_c matrix (64 x 64), aliased as sDeltaS_accum
+    using SwizzleF32  = Swizzle<3, 2, 3>;
+    using SwizzleHalf = Swizzle<3, 3, 3>;
+    using SwizzleR    = Swizzle<1, 3, 3>;
 
-    T* sDeltaS_accum = sW; // Epilogue alias for GEMM
+    auto layout_ds_f32  = composition(SwizzleF32{},  make_layout(make_shape(Int<B_V>{}, Int<D_K>{}),        make_stride(Int<D_K>{}, Int<1>{})));
+    auto layout_ds_f16  = composition(SwizzleHalf{}, make_layout(make_shape(Int<B_V>{}, Int<D_K>{}),        make_stride(Int<D_K>{}, Int<1>{})));
+    auto layout_mat_km  = composition(SwizzleHalf{}, make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto layout_mat_mnm = composition(SwizzleHalf{}, make_layout(make_shape(Int<D_K>{}, Int<CHUNK_SIZE>{}), make_stride(Int<1>{}, Int<D_K>{})));
+    // Swizzle<1, 3, 3> flips bit 3 every 4 rows to avoid bank conflicts on SM75_U16x4_LDSM_T
+    auto layout_dr_flat = composition(SwizzleR{},    make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<B_V>{}), make_stride(Int<B_V>{}, Int<1>{})));
+    auto layout_dr_mnm  = composition(SwizzleR{},    make_layout(make_shape(Int<B_V>{}, Int<CHUNK_SIZE>{}), make_stride(Int<1>{}, Int<B_V>{})));
 
-    using SwizzleOp = Swizzle<3, 3, 3>;
+    auto sDeltaS_f32_flat = make_tensor(make_smem_ptr(sDeltaS_f32), layout_ds_f32);
+    auto sDeltaS_f16_flat = make_tensor(make_smem_ptr(sDeltaS_f16), layout_ds_f16);
+    auto sMat_flat        = make_tensor(make_smem_ptr(sMat),        layout_mat_km);
+    auto sMat_mnm         = make_tensor(make_smem_ptr(sMat),        layout_mat_mnm);
+    auto sDR_flat         = make_tensor(make_smem_ptr(sDR),         layout_dr_flat);
+    auto sDR_mnm          = make_tensor(make_smem_ptr(sDR),         layout_dr_mnm);
 
-    auto smem_layout_flat_v = composition(SwizzleOp{}, make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
-    auto smem_layout_flat_k = composition(SwizzleOp{}, make_layout(make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    TiledCopyHalf  tiled_copy_h;
+    TiledCopyR     tiled_copy_r;
+    TiledCopyFloat tiled_copy_f32;
+    auto thr_copy_h   = tiled_copy_h.get_slice(tid);
+    auto thr_copy_r   = tiled_copy_r.get_slice(tid);
+    auto thr_copy_f32 = tiled_copy_f32.get_slice(tid);
 
-    // GEMM Layouts: Delta_S_new = Delta_S @ W_c^T
-    // Op A (Delta_S): Shape (M=16, K=64), Stride (64, 1) -> Row-Major (K-major)
-    auto smem_layout_mma_A = composition(SwizzleOp{}, make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
-    // Op B (W_c): Shape (N=64, K=64), Stride (64, 1) -> Row-Major (A @ B^T = Delta_S @ W^T)
-    auto smem_layout_mma_B = composition(SwizzleOp{}, make_layout(make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
-    // Op C (Delta_S_accum): Shape (M=16, N=64), Stride (64, 1) -> Row-Major
-    auto smem_layout_mma_C = composition(SwizzleOp{}, make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+    auto tXsDS_f32_s = thr_copy_f32.partition_S(sDeltaS_f32_flat);
+    auto tXsDS_f32_d = thr_copy_f32.partition_D(sDeltaS_f32_flat);
+    auto tXsDS_f16_d = thr_copy_h.partition_D(sDeltaS_f16_flat);
+    auto tXsMat_d    = thr_copy_h.partition_D(sMat_flat);
+    auto tXsDR_s     = thr_copy_r.partition_S(sDR_flat);
+    auto tXsDR_d     = thr_copy_r.partition_D(sDR_flat);
 
-    auto sDeltaS_flat = make_tensor(make_smem_ptr(sDeltaS), smem_layout_flat_v);
-    auto sW_flat      = make_tensor(make_smem_ptr(sW),      smem_layout_flat_k);
-    auto sAccum_flat  = make_tensor(make_smem_ptr(sDeltaS_accum), smem_layout_flat_v);
+    auto rDS_cur   = make_fragment_like(tXsDS_f32_s);
+    auto rDS_out   = make_fragment_like(tXsDS_f32_s);
+    auto rDS_f16   = make_fragment_like(tXsDS_f16_d);
+    auto rDR_slice = make_fragment_like(tXsDR_s);
+    auto tCrMat    = make_fragment_like(tXsMat_d);
 
-    auto sDeltaS_mma = make_tensor(make_smem_ptr(sDeltaS), smem_layout_mma_A);
-    auto sW_mma      = make_tensor(make_smem_ptr(sW),      smem_layout_mma_B);
-    auto sAccum_mma  = make_tensor(make_smem_ptr(sDeltaS_accum), smem_layout_mma_C);
+    auto layout_vk_slice = make_layout(make_shape(Int<B_V>{}, Int<D_K>{}),        make_stride(Int<D_K>{}, Int<1>{}));
+    auto layout_ck_full  = make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{}));
+    auto layout_cv_slice = make_layout(make_shape(Int<CHUNK_SIZE>{}, Int<B_V>{}), make_stride(Int<D_V>{}, Int<1>{}));
 
-    // TiledMMA & Partitioning (Layout<Shape<_1, _4, _1>>)
-    TiledMMAType tiled_mma;
-    auto thr_mma = tiled_mma.get_slice(tid);
-
-    // S2R Copy for GEMM (LDSM_N)
-    auto s2r_copy_a = make_tiled_copy_A(S2RCopyAtomA{}, tiled_mma);
-    auto s2r_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
-    auto s2r_thr_copy_a = s2r_copy_a.get_slice(tid);
-    auto s2r_thr_copy_b = s2r_copy_b.get_slice(tid);
-
-    auto tCsA = s2r_thr_copy_a.partition_S(sDeltaS_mma);
-    auto tCsB = s2r_thr_copy_b.partition_S(sW_mma);
-    auto tCsC = thr_mma.partition_C(sAccum_mma);
-
-    auto tCrA = thr_mma.partition_fragment_A(sDeltaS_mma);
-    auto tCrB = thr_mma.partition_fragment_B(sW_mma);
-    auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);
-    auto tCrB_view = s2r_thr_copy_b.retile_D(tCrB);
-
-    TiledCopyG2R tiled_copy_g2r;
-    TiledCopyStore tiled_copy_store;
-    auto thr_copy_g2r   = tiled_copy_g2r.get_thread_slice(tid);
-    auto thr_copy_store = tiled_copy_store.get_thread_slice(tid);
-
-    constexpr int ROWS_PER_STP = 16;
-    constexpr int NUM_STPS_V   = B_V / ROWS_PER_STP; // 16 / 16 = 1 step
-    constexpr int NUM_STPS_K   = D_K / ROWS_PER_STP; // 64 / 16 = 4 steps
-
-    auto dummy_tile = local_tile(sDeltaS_flat, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(0, 0));
-    auto dummy_part = thr_copy_g2r.partition_S(dummy_tile);
-
-    decltype(make_fragment_like(dummy_part)) rTmp[NUM_STPS_V];
-    decltype(make_fragment_like(dummy_part)) rW_tmp[NUM_STPS_K];
-
-    #pragma unroll
-    for (int st = 0; st < NUM_STPS_V; ++st) {
-        clear(rTmp[st]);
-    }
-    #pragma unroll
-    for (int st = 0; st < NUM_STPS_K; ++st) {
-        clear(rW_tmp[st]);
-    }
-
-    // Zero-length sequence handling: start_c >= end_c
-    // If has_state_old: write grad_final_states (or 0) to grad_state_old
+    // 2. Empty sequence handling
     if (start_c >= end_c) {
         if (has_state_old && gGradStateOld != nullptr) {
-            T* p_grad_state_old = gGradStateOld + state_offset;
-            auto gGradStateOld_chunk = make_tensor(make_gmem_ptr(p_grad_state_old), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
             if (gGradFinalStates != nullptr) {
-                const T* p_grad_final = gGradFinalStates + state_offset;
-                auto gGradFinal_chunk = make_tensor(make_gmem_ptr(p_grad_final), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
-                #pragma unroll
-                for (int st = 0; st < NUM_STPS_V; ++st) {
-                    auto gGradFinal_step    = local_tile(gGradFinal_chunk,    make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-                    auto gGradStateOld_step = local_tile(gGradStateOld_chunk, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-                    cute::copy(tiled_copy_g2r, thr_copy_g2r.partition_S(gGradFinal_step), rTmp[st]);
-                    auto tD_gstate = thr_copy_store.partition_D(gGradStateOld_step);
-                    *reinterpret_cast<uint4*>(&tD_gstate(0)) = *reinterpret_cast<const uint4*>(&rTmp[st](0));
-                }
+                auto gGradFinal_slice = make_tensor(make_gmem_ptr(gGradFinalStates + state_offset), layout_vk_slice);
+                cute::copy(tiled_copy_f32, thr_copy_f32.partition_S(gGradFinal_slice), rDS_cur);
             } else {
-                #pragma unroll
-                for (int st = 0; st < NUM_STPS_V; ++st) {
-                    auto gGradStateOld_step = local_tile(gGradStateOld_chunk, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-                    auto tD_gstate = thr_copy_store.partition_D(gGradStateOld_step);
-                    *reinterpret_cast<uint4*>(&tD_gstate(0)) = *reinterpret_cast<const uint4*>(&rTmp[st](0));
-                }
+                clear(rDS_cur);
             }
+            auto gGradOld_slice = make_tensor(make_gmem_ptr(gGradStateOld + state_offset), layout_vk_slice);
+            cute::copy(tiled_copy_f32, rDS_cur, thr_copy_f32.partition_D(gGradOld_slice));
         }
         return;
     }
 
-    // Stage 3: Initialize Delta_S Accumulator from grad_final_states
+    // Declare G-tile fragments and boundary predicates once outside the reverse scan loop
+    auto cTile64 = make_identity_tensor(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}));
+    auto tXcK    = thr_copy_h.partition_S(cTile64);
+    auto tXcG    = thr_copy_f32.partition_S(cTile64);
+    auto tCrG    = make_fragment_like<float>(tXcG);
+    auto tPredK  = make_fragment_like<bool>(tXsMat_d);
+    auto tPredG  = make_fragment_like<bool>(tXcG);
+
+    int32_t last_valid_len = chunk_valid_lens[end_c - 1];
+    if (last_valid_len < CHUNK_SIZE) {
+        #pragma unroll
+        for (int m = 0; m < size<1>(tPredK); ++m) {
+            #pragma unroll
+            for (int n = 0; n < size<2>(tPredK); ++n) {
+                bool in_bounds = (get<0>(tXcK(Int<0>{}, m, n)) < last_valid_len);
+                #pragma unroll
+                for (int v = 0; v < size<0>(tPredK); ++v) {
+                    tPredK(v, m, n) = in_bounds;
+                }
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < size<1>(tPredG); ++m) {
+            #pragma unroll
+            for (int n = 0; n < size<2>(tPredG); ++n) {
+                bool in_bounds = (get<0>(tXcG(Int<0>{}, m, n)) < last_valid_len);
+                #pragma unroll
+                for (int v = 0; v < size<0>(tPredG); ++v) {
+                    tPredG(v, m, n) = in_bounds;
+                }
+            }
+        }
+    }
+
+    // Shared GEMM operand & accumulator fragments (identical shapes on TiledMMA411 and TiledMMA141)
+    TiledMMA411 tiled_mma_1;
+    TiledMMA141 tiled_mma_2;
+    auto thr_mma_1 = tiled_mma_1.get_slice(tid);
+    auto thr_mma_2 = tiled_mma_2.get_slice(tid);
+
+    auto s2r_copy_a1 = make_tiled_copy_A(S2RCopyAtomA_KM{},  tiled_mma_1);
+    auto s2r_copy_b1 = make_tiled_copy_B(S2RCopyAtomB_KM{},  tiled_mma_1);
+    auto s2r_copy_a2 = make_tiled_copy_A(S2RCopyAtomA_MNM{}, tiled_mma_2);
+    auto s2r_copy_b2 = make_tiled_copy_B(S2RCopyAtomB_MNM{}, tiled_mma_2);
+
+    auto s2r_thr_a1 = s2r_copy_a1.get_slice(tid);
+    auto s2r_thr_b1 = s2r_copy_b1.get_slice(tid);
+    auto s2r_thr_a2 = s2r_copy_a2.get_slice(tid);
+    auto s2r_thr_b2 = s2r_copy_b2.get_slice(tid);
+
+    auto tCsA_1  = s2r_thr_a1.partition_S(sMat_flat);
+    auto tCsB_1  = s2r_thr_b1.partition_S(sDeltaS_f16_flat);
+    auto tCsC_dR = thr_mma_1.partition_C(sDR_flat);
+
+    auto tCsA_2 = s2r_thr_a2.partition_S(sDR_mnm);
+    auto tCsB_2 = s2r_thr_b2.partition_S(sMat_mnm);
+    auto tCsC_S = thr_mma_2.partition_C(sDeltaS_f32_flat);
+
+    auto tCrA        = thr_mma_1.partition_fragment_A(sMat_flat);
+    auto tCrB        = thr_mma_1.partition_fragment_B(sDeltaS_f16_flat);
+    auto tCrC        = thr_mma_1.make_fragment_C(tCsC_dR);
+    auto rC_half     = make_tensor_like<T>(tCrC);
+    auto tCrA_view_1 = s2r_thr_a1.retile_D(tCrA);
+    auto tCrB_view_1 = s2r_thr_b1.retile_D(tCrB);
+    auto tCrA_view_2 = s2r_thr_a2.retile_D(tCrA);
+    auto tCrB_view_2 = s2r_thr_b2.retile_D(tCrB);
+
+    // 3. Prologue: initialize sDeltaS_f32 from grad_final_states
     if (gGradFinalStates != nullptr) {
-        const T* p_grad_final = gGradFinalStates + state_offset;
-        auto gGradFinal_chunk = make_tensor(make_gmem_ptr(p_grad_final), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
-
-        #pragma unroll
-        for (int st = 0; st < NUM_STPS_V; ++st) {
-            auto gGradFinal_step = local_tile(gGradFinal_chunk, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            auto sDeltaS_step    = local_tile(sDeltaS_flat,     make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-
-            cute::copy(tiled_copy_g2r, thr_copy_g2r.partition_S(gGradFinal_step), rTmp[st]);
-            auto tDeltaS = thr_copy_g2r.partition_D(sDeltaS_step);
-            *reinterpret_cast<uint4*>(&tDeltaS(0)) = *reinterpret_cast<const uint4*>(&rTmp[st](0));
-        }
+        auto gGradFinal_slice = make_tensor(make_gmem_ptr(gGradFinalStates + state_offset), layout_vk_slice);
+        cute::copy(tiled_copy_f32, thr_copy_f32.partition_S(gGradFinal_slice), rDS_cur);
     } else {
-        #pragma unroll
-        for (int st = 0; st < NUM_STPS_V; ++st) {
-            auto sDeltaS_step = local_tile(sDeltaS_flat, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            clear(rTmp[st]);
-            auto tDeltaS = thr_copy_g2r.partition_D(sDeltaS_step);
-            *reinterpret_cast<uint4*>(&tDeltaS(0)) = *reinterpret_cast<const uint4*>(&rTmp[st](0));
-        }
+        clear(rDS_cur);
+    }
+    #pragma unroll
+    for (int x = 0; x < 2; ++x) {
+        *reinterpret_cast<uint4*>(&tXsDS_f32_d(make_coord(Int<0>{}, x), Int<0>{}, Int<0>{})) =
+            *reinterpret_cast<const uint4*>(&rDS_cur(make_coord(Int<0>{}, x), Int<0>{}, Int<0>{}));
     }
     __syncthreads();
 
-    // Stage 4: Reverse Scan Loop c = end_c - 1 .. start_c
+    // 4. Reverse chunk scan loop
     for (int32_t c = end_c - 1; c >= start_c; --c) {
-        int64_t chunk_mat_offset_v = ((int64_t)head_idx * num_chunks + c) * mat_elements_v + slice_offset_v;
-        int64_t chunk_mat_offset_k = ((int64_t)head_idx * num_chunks + c) * mat_elements_k;
+        int32_t chunk_start     = chunk_offsets[c];
+        int32_t valid_len       = chunk_valid_lens[c];
+        bool    is_zero_dS_next = (c == end_c - 1 && gGradFinalStates == nullptr);
 
-        // 1. Prefetch W_c from GMEM into registers rW_tmp (NUM_STPS_K steps)
-        const T* p_w_curr = gW + chunk_mat_offset_k;
-        auto gW_chunk = make_tensor(make_gmem_ptr(p_w_curr), make_layout(make_shape(Int<D_K>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+        int64_t ds_off  = (static_cast<int64_t>(head_idx) * num_chunks + c) * mat_elements_vk + slice_offset_v;
+        int64_t y_off   = (static_cast<int64_t>(head_idx) * num_chunks + c) * mat_elements_ck;
+        int64_t dr_off  = (static_cast<int64_t>(head_idx) * num_chunks + c) * mat_elements_cv + static_cast<int64_t>(v_idx) * B_V;
+        int64_t tok_off = (head_tok_base + chunk_start) * D_K;
 
-        #pragma unroll
-        for (int st = 0; st < NUM_STPS_K; ++st) {
-            auto gW_step = local_tile(gW_chunk, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            cute::copy(tiled_copy_g2r, thr_copy_g2r.partition_S(gW_step), rW_tmp[st]);
-        }
+        auto gDS_slice = make_tensor(make_gmem_ptr(gDS_inout + ds_off),  layout_vk_slice);
+        auto gDR_slice = make_tensor(make_gmem_ptr(gDR_inout + dr_off),  layout_cv_slice);
+        auto gY_chunk  = make_tensor(make_gmem_ptr(gY        + y_off),   layout_ck_full);
+        auto gK_chunk  = make_tensor(make_gmem_ptr(gK_h      + tok_off), layout_ck_full);
+        auto gG_chunk  = make_tensor(make_gmem_ptr(gG_log2_h + tok_off), layout_ck_full);
 
-        // 2. Store gradient dY[:, c] = Delta_S to GMEM while prefetching W_c
-        T* p_gy = gGradY + chunk_mat_offset_v;
-        auto gGradY_chunk = make_tensor(make_gmem_ptr(p_gy), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
+        // Read dS_out, then overwrite gDS_inout[h, c] in-place with running dS_{c+1}
+        cute::copy(tiled_copy_f32, thr_copy_f32.partition_S(gDS_slice), rDS_out);
+        cute::copy(tiled_copy_f32, tXsDS_f32_s, rDS_cur);
+        cute::copy(tiled_copy_f32, rDS_cur, thr_copy_f32.partition_D(gDS_slice));
 
-        #pragma unroll
-        for (int st = 0; st < NUM_STPS_V; ++st) {
-            auto sDeltaS_step = local_tile(sDeltaS_flat, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            auto gGradY_step  = local_tile(gGradY_chunk,  make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-
-            auto tS_delta = thr_copy_store.partition_S(sDeltaS_step);
-            decltype(make_fragment_like(tS_delta)) rDelta_slice;
-            cute::copy(tS_delta, rDelta_slice);
-
-            auto tD_gy = thr_copy_store.partition_D(gGradY_step);
-            *reinterpret_cast<uint4*>(&tD_gy(0)) = *reinterpret_cast<const uint4*>(&rDelta_slice(0));
-        }
-
-        // 3. Store W_c from registers rW_tmp to SMEM sW
-        #pragma unroll
-        for (int st = 0; st < NUM_STPS_K; ++st) {
-            auto sW_step = local_tile(sW_flat, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            auto tWsW    = thr_copy_g2r.partition_D(sW_step);
-            *reinterpret_cast<uint4*>(&tWsW(0)) = *reinterpret_cast<const uint4*>(&rW_tmp[st](0));
-        }
-        __syncthreads(); // Synchronize to ensure sW and sDeltaS are ready for GEMM
-
-        // 4. GEMM: Delta_S_accum = Delta_S @ W_c^T
-        auto tCrC_DeltaS = thr_mma.make_fragment_C(tCsC);
-        clear(tCrC_DeltaS);
-
-        cute::copy(s2r_copy_a, tCsA, tCrA_view);
-        cute::copy(s2r_copy_b, tCsB, tCrB_view);
-        __syncthreads();
-
-        cute::gemm(MMAAtom{}, tCrA, tCrB, tCrC_DeltaS);
-
-        // GEMM Epilogue: Convert to FP16 and write to sDeltaS_accum (aliased on sW)
-        auto rC_half_DeltaS = make_tensor_like<T>(tCrC_DeltaS);
-        #pragma unroll
-        for (int i = 0; i < size(rC_half_DeltaS); ++i) {
-            rC_half_DeltaS(i) = float_to_out<T>(tCrC_DeltaS(i));
-        }
-        cute::copy(rC_half_DeltaS, tCsC);
-        __syncthreads();
-
-        // 5. Accumulate Delta_S_new = Delta_S_accum + grad_S_list[:, c] into sDeltaS
-        const T* p_grad_s = gGradSList + chunk_mat_offset_v;
-        auto gGradS_chunk = make_tensor(make_gmem_ptr(p_grad_s), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
-
-        #pragma unroll
-        for (int st = 0; st < NUM_STPS_V; ++st) {
-            auto sAccum_step  = local_tile(sAccum_flat,  make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            auto gGradS_step  = local_tile(gGradS_chunk,  make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            auto sDeltaS_step = local_tile(sDeltaS_flat, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-
-            auto tS_accum = thr_copy_store.partition_S(sAccum_step);
-            decltype(make_fragment_like(tS_accum)) rAccum_slice;
-            cute::copy(tS_accum, rAccum_slice);
-
-            decltype(make_fragment_like(tS_accum)) rGradS_slice;
-            cute::copy(tiled_copy_g2r, thr_copy_g2r.partition_S(gGradS_step), rGradS_slice);
-
-            decltype(make_fragment_like(tS_accum)) rNew_delta;
+        if (is_zero_dS_next) {
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                float acc_f = half_to_float(rAccum_slice(i));
-                float gs_f  = half_to_float(rGradS_slice(i));
-                rNew_delta(i) = float_to_out<T>(acc_f + gs_f);
+            for (int x = 0; x < 2; ++x) {
+                *reinterpret_cast<uint4*>(&tXsDS_f32_d(make_coord(Int<0>{}, x), Int<0>{}, Int<0>{})) =
+                    *reinterpret_cast<const uint4*>(&rDS_out(make_coord(Int<0>{}, x), Int<0>{}, Int<0>{}));
+            }
+            cute::copy(tiled_copy_r, thr_copy_r.partition_S(gDR_slice), rDR_slice);
+            *reinterpret_cast<uint4*>(&tXsDR_d(Int<0>{}, Int<0>{}, Int<0>{})) =
+                *reinterpret_cast<const uint4*>(&rDR_slice(Int<0>{}, Int<0>{}, Int<0>{}));
+
+            cute::copy(tiled_copy_h, thr_copy_h.partition_S(gY_chunk), tCrMat);
+            #pragma unroll
+            for (int m = 0; m < size<1>(tXsMat_d); ++m) {
+                *reinterpret_cast<uint4*>(&tXsMat_d(Int<0>{}, m, Int<0>{})) =
+                    *reinterpret_cast<const uint4*>(&tCrMat(Int<0>{}, m, Int<0>{}));
+            }
+            __syncthreads();
+        } else {
+            #pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                rDS_f16(v, Int<0>{}, Int<0>{}) = float_to_out<T>(rDS_cur(v, Int<0>{}, Int<0>{}));
+            }
+            *reinterpret_cast<uint4*>(&tXsDS_f16_d(Int<0>{}, Int<0>{}, Int<0>{})) =
+                *reinterpret_cast<const uint4*>(&rDS_f16(Int<0>{}, Int<0>{}, Int<0>{}));
+
+            // Pre-accumulate dS_out + dS_{c+1} * exp2(G_last) into sDeltaS_f32 before GEMM 2
+            const float* p_g_last = gG_log2_h + (head_tok_base + chunk_start + valid_len - 1) * D_K;
+            float4 g_last0 = *reinterpret_cast<const float4*>(p_g_last + col_base);
+            float4 g_last1 = *reinterpret_cast<const float4*>(p_g_last + col_base + 4);
+            float g_last_reg[8] = {g_last0.x, g_last0.y, g_last0.z, g_last0.w,
+                                   g_last1.x, g_last1.y, g_last1.z, g_last1.w};
+
+            #pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                rDS_cur(v, Int<0>{}, Int<0>{}) =
+                    rDS_out(v, Int<0>{}, Int<0>{}) +
+                    rDS_cur(v, Int<0>{}, Int<0>{}) * exp2f(g_last_reg[v]);
+            }
+            #pragma unroll
+            for (int x = 0; x < 2; ++x) {
+                *reinterpret_cast<uint4*>(&tXsDS_f32_d(make_coord(Int<0>{}, x), Int<0>{}, Int<0>{})) =
+                    *reinterpret_cast<const uint4*>(&rDS_cur(make_coord(Int<0>{}, x), Int<0>{}, Int<0>{}));
             }
 
-            auto tD_new_delta = thr_copy_g2r.partition_D(sDeltaS_step);
-            *reinterpret_cast<uint4*>(&tD_new_delta(0)) = *reinterpret_cast<const uint4*>(&rNew_delta(0));
+            cute::copy(tiled_copy_r, thr_copy_r.partition_S(gDR_slice), rDR_slice);
+            *reinterpret_cast<uint4*>(&tXsDR_d(Int<0>{}, Int<0>{}, Int<0>{})) =
+                *reinterpret_cast<const uint4*>(&rDR_slice(Int<0>{}, Int<0>{}, Int<0>{}));
+
+            // Recompute K_tail into sMat for GEMM 1
+            if (valid_len == CHUNK_SIZE) {
+                cute::copy(tiled_copy_h,   thr_copy_h.partition_S(gK_chunk),   tCrMat);
+                cute::copy(tiled_copy_f32, thr_copy_f32.partition_S(gG_chunk), tCrG);
+            } else {
+                clear(tCrMat);
+                clear(tCrG);
+                cute::copy_if(tiled_copy_h,   tPredK, thr_copy_h.partition_S(gK_chunk),   tCrMat);
+                cute::copy_if(tiled_copy_f32, tPredG, thr_copy_f32.partition_S(gG_chunk), tCrG);
+            }
+
+            #pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                int  local_row = m * 16 + row_id;
+                bool row_valid = (local_row < valid_len);
+                #pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    float k_val = row_valid
+                        ? (half_to_float(tCrMat(v, m, Int<0>{})) * exp2f(g_last_reg[v] - tCrG(v, m, Int<0>{})))
+                        : 0.0f;
+                    tCrMat(v, m, Int<0>{}) = float_to_out<T>(k_val);
+                }
+            }
+            #pragma unroll
+            for (int m = 0; m < size<1>(tXsMat_d); ++m) {
+                *reinterpret_cast<uint4*>(&tXsMat_d(Int<0>{}, m, Int<0>{})) =
+                    *reinterpret_cast<const uint4*>(&tCrMat(Int<0>{}, m, Int<0>{}));
+            }
+            __syncthreads();
+
+            // GEMM 1: dR_total = dR_out + K_tail @ dS_{c+1}_f16^T
+            #pragma unroll
+            for (int i = 0; i < size(tCrC); ++i) {
+                tCrC(i) = half_to_float(tCsC_dR(i));
+            }
+            cute::copy(s2r_copy_a1, tCsA_1, tCrA_view_1);
+            cute::copy(s2r_copy_b1, tCsB_1, tCrB_view_1);
+            cute::gemm(MMAAtom{}, tCrA, tCrB, tCrC);
+
+            #pragma unroll
+            for (int i = 0; i < size(tCrC); ++i) {
+                rC_half(i) = float_to_out<T>(tCrC(i));
+            }
+            cute::copy(rC_half, tCsC_dR);
+            __syncthreads();
+
+            cute::copy(tiled_copy_r, tXsDR_s, rDR_slice);
+            cute::copy(tiled_copy_r, rDR_slice, thr_copy_r.partition_D(gDR_slice));
+
+            cute::copy(tiled_copy_h, thr_copy_h.partition_S(gY_chunk), tCrMat);
+            #pragma unroll
+            for (int m = 0; m < size<1>(tXsMat_d); ++m) {
+                *reinterpret_cast<uint4*>(&tXsMat_d(Int<0>{}, m, Int<0>{})) =
+                    *reinterpret_cast<const uint4*>(&tCrMat(Int<0>{}, m, Int<0>{}));
+            }
+            __syncthreads();
         }
+
+        // GEMM 2: dS_prev = (dS_out + dS_{c+1} * exp2(G_last)) - dR_total^T @ Y_c in FP32
+        clear(tCrC);
+        cute::copy(s2r_copy_a2, tCsA_2, tCrA_view_2);
+        cute::copy(s2r_copy_b2, tCsB_2, tCrB_view_2);
+        cute::gemm(MMAAtom{}, tCrA, tCrB, tCrC);
+
+        #pragma unroll
+        for (int i = 0; i < size(tCrC); ++i) {
+            tCrC(i) = tCsC_S(i) - tCrC(i);
+        }
+        cute::copy(tCrC, tCsC_S);
         __syncthreads();
     }
 
-    // Stage 5: Write initial state gradient (grad_state_old) if requested
+    // 5. Epilogue: emit grad_state_old [FP32] when requested
     if (has_state_old && gGradStateOld != nullptr) {
-        T* p_grad_state_old = gGradStateOld + state_offset;
-        auto gGradStateOld_chunk = make_tensor(make_gmem_ptr(p_grad_state_old), make_layout(make_shape(Int<B_V>{}, Int<D_K>{}), make_stride(Int<D_K>{}, Int<1>{})));
-
-        #pragma unroll
-        for (int st = 0; st < NUM_STPS_V; ++st) {
-            auto sDeltaS_step       = local_tile(sDeltaS_flat,        make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-            auto gGradStateOld_step = local_tile(gGradStateOld_chunk, make_shape(Int<ROWS_PER_STP>{}, Int<D_K>{}), make_coord(st, 0));
-
-            auto tS_delta = thr_copy_store.partition_S(sDeltaS_step);
-            decltype(make_fragment_like(tS_delta)) rDelta_slice;
-            cute::copy(tS_delta, rDelta_slice);
-
-            auto tD_gstate = thr_copy_store.partition_D(gGradStateOld_step);
-            *reinterpret_cast<uint4*>(&tD_gstate(0)) = *reinterpret_cast<const uint4*>(&rDelta_slice(0));
-        }
+        auto gGradOld_slice = make_tensor(make_gmem_ptr(gGradStateOld + state_offset), layout_vk_slice);
+        cute::copy(tiled_copy_f32, tXsDS_f32_s, rDS_cur);
+        cute::copy(tiled_copy_f32, rDS_cur, thr_copy_f32.partition_D(gGradOld_slice));
     }
 }
 
-// HOST COORDINATION FUNCTION (chunk_scan_bwd)
+// ============================================================================
+// Part 2: Host Dispatch Functions
+// ============================================================================
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-chunk_scan_bwd(
-    const at::Tensor& grad_S_list,                     // (num_kv_heads, num_chunks, d_v, d_k) [FP16]
-    const at::Tensor& W,                               // (num_kv_heads, num_chunks, d_k, d_k) [FP16]
-    const at::Tensor& S_list,                          // (num_kv_heads, num_chunks, d_v, d_k) [FP16]
-    const at::Tensor& cu_seq_lens,                     // (batch_size + 1,) [Int32 / Int64]
-    const std::optional<at::Tensor>& grad_final_states, // (batch_size, num_kv_heads, d_v, d_k) [FP16]
-    bool has_state_old,                                // scalar [bool]
-    int64_t chunk_size                                 // scalar [int64] (default 64)
+chunk_scan_bwd_with_meta(
+    at::Tensor& dS_inout,
+    at::Tensor& dR_inout,
+    const at::Tensor& Y,
+    const at::Tensor& k_h,
+    const at::Tensor& G_log2_h,
+    const VarlenChunkMeta& meta,
+    int64_t batch_size,
+    const std::optional<at::Tensor>& grad_final_states,
+    bool has_state_old,
+    int64_t chunk_size
 ) {
-    // Stage 1 - Input Validation
-    TORCH_CHECK(W.is_cuda(), "W must be a CUDA tensor");
-    const c10::cuda::CUDAGuard device_guard(W.device());
-
-    TORCH_CHECK(grad_S_list.is_cuda(), "grad_S_list must be a CUDA tensor");
-    TORCH_CHECK(S_list.is_cuda(), "S_list must be a CUDA tensor");
-    TORCH_CHECK(cu_seq_lens.is_cuda(), "cu_seq_lens must be a CUDA tensor");
-
-    TORCH_CHECK(grad_S_list.device() == W.device(), "grad_S_list must be on the same device as W");
-    TORCH_CHECK(S_list.device() == W.device(), "S_list must be on the same device as W");
-    TORCH_CHECK(cu_seq_lens.device() == W.device(), "cu_seq_lens must be on the same device as W");
-
-    TORCH_CHECK(grad_S_list.scalar_type() == at::ScalarType::Half, "grad_S_list must be FP16 (torch.float16)");
-    TORCH_CHECK(W.scalar_type() == at::ScalarType::Half, "W must be FP16 (torch.float16)");
-    TORCH_CHECK(S_list.scalar_type() == at::ScalarType::Half, "S_list must be FP16 (torch.float16)");
-    TORCH_CHECK(cu_seq_lens.scalar_type() == at::ScalarType::Int || cu_seq_lens.scalar_type() == at::ScalarType::Long,
-                "cu_seq_lens must be Int32 or Int64");
-
-    TORCH_CHECK(grad_S_list.dim() == 4, "grad_S_list must be 4D tensor with shape (num_kv_heads, num_chunks, d_v, d_k)");
-    TORCH_CHECK(W.dim() == 4, "W must be 4D tensor with shape (num_kv_heads, num_chunks, d_k, d_k)");
-    TORCH_CHECK(S_list.dim() == 4, "S_list must be 4D tensor with shape (num_kv_heads, num_chunks, d_v, d_k)");
-    TORCH_CHECK(cu_seq_lens.dim() == 1, "cu_seq_lens must be 1D tensor with shape (batch_size + 1,)");
-
-    const at::Tensor gS = ensure_aligned16(grad_S_list.contiguous());
-    TORCH_CHECK(W.is_contiguous(), "W must be contiguous");
-    TORCH_CHECK(S_list.is_contiguous(), "S_list must be contiguous");
-
-    int64_t num_kv_heads = W.size(0);
-    int64_t num_chunks   = W.size(1);
-    int64_t d_k          = W.size(2);
-    int64_t d_k_col      = W.size(3);
-
-    int64_t num_s_heads  = S_list.size(0);
-    int64_t num_s_chunks = S_list.size(1);
-    int64_t d_v          = S_list.size(2);
-    int64_t d_v_k        = S_list.size(3);
-
-    TORCH_CHECK(num_s_heads == num_kv_heads && num_s_chunks == num_chunks,
-                "S_list dimensions (num_kv_heads, num_chunks) must match W");
-    TORCH_CHECK(gS.size(0) == num_kv_heads && gS.size(1) == num_chunks,
-                "grad_S_list dimensions (num_kv_heads, num_chunks) must match W");
-    TORCH_CHECK(gS.size(2) == d_v && gS.size(3) == d_k,
-                "grad_S_list trailing dimensions must match S_list (d_v, d_k)");
-
-    TORCH_CHECK(d_k == 64 && d_k_col == 64, "W trailing dimensions must be 64x64 (d_k == 64 on SM75+)");
-    TORCH_CHECK(d_v == 64 && d_v_k == 64, "S_list trailing dimensions must be 64x64 (d_v == 64 on SM75+)");
-    TORCH_CHECK(chunk_size == 64, "chunk_size must be 64 for optimal SM alignment");
-
-    int64_t batch_size = cu_seq_lens.size(0) - 1;
+    TORCH_CHECK(chunk_size == 64, "chunk_size must be 64");
     TORCH_CHECK(batch_size >= 0, "batch_size must be >= 0");
+    TORCH_CHECK(Y.is_cuda(), "Y must be a CUDA tensor");
+    const c10::cuda::CUDAGuard device_guard(Y.device());
 
-    at::Tensor cu_chunk_lens = compute_cu_chunk_lens(cu_seq_lens, chunk_size);
-    at::Tensor cu_chunk_lens_i32 = cu_chunk_lens.to(at::kInt).contiguous();
+    auto check_t = [&](const at::Tensor& t, const char* name, int64_t expected_dim, at::ScalarType dtype) {
+        TORCH_CHECK(t.is_cuda() && t.device() == Y.device(), name, " must be on the same CUDA device as Y");
+        TORCH_CHECK(t.scalar_type() == dtype, name, " dtype mismatch");
+        TORCH_CHECK(t.dim() == expected_dim && t.is_contiguous(), name, " must be contiguous with expected rank");
+    };
+
+    check_t(dS_inout, "dS_inout", 4, at::ScalarType::Float);
+    check_t(dR_inout, "dR_inout", 4, at::ScalarType::Half);
+    check_t(Y,        "Y",        4, at::ScalarType::Half);
+    check_t(k_h,      "k_h",      3, at::ScalarType::Half);
+    check_t(G_log2_h, "G_log2_h", 3, at::ScalarType::Float);
+
+    int64_t num_kv_heads = Y.size(0);
+    int64_t num_chunks   = Y.size(1);
+    int64_t total_L      = k_h.size(1);
+    int64_t d_k          = Y.size(3);
+    int64_t d_v          = dR_inout.size(3);
+
+    TORCH_CHECK(Y.size(2) == chunk_size && d_k == 64, "Y trailing dimensions must be (64, 64)");
+    TORCH_CHECK(dS_inout.size(0) == num_kv_heads && dS_inout.size(1) == num_chunks &&
+                dS_inout.size(2) == d_v && dS_inout.size(3) == d_k, "dS_inout shape mismatch");
+    TORCH_CHECK(dR_inout.size(0) == num_kv_heads && dR_inout.size(1) == num_chunks &&
+                dR_inout.size(2) == chunk_size && d_v == 64, "dR_inout shape mismatch");
+    TORCH_CHECK(k_h.size(0) == num_kv_heads && k_h.size(2) == d_k, "k_h shape mismatch");
+    TORCH_CHECK(G_log2_h.size(0) == num_kv_heads && G_log2_h.size(1) == total_L &&
+                G_log2_h.size(2) == d_k, "G_log2_h shape mismatch");
+    TORCH_CHECK(meta.num_chunks == num_chunks, "meta.num_chunks mismatch");
+
+    TORCH_CHECK(meta.cu_chunk_lens.is_cuda() && meta.cu_chunk_lens.device() == Y.device() &&
+                meta.cu_chunk_lens.scalar_type() == at::ScalarType::Int &&
+                meta.cu_chunk_lens.dim() == 1 && meta.cu_chunk_lens.is_contiguous() &&
+                meta.cu_chunk_lens.size(0) == batch_size + 1, "meta.cu_chunk_lens mismatch");
+
+    if (num_chunks > 0) {
+        TORCH_CHECK(meta.chunk_offsets.is_cuda() && meta.chunk_offsets.device() == Y.device() &&
+                    meta.chunk_offsets.scalar_type() == at::ScalarType::Int &&
+                    meta.chunk_offsets.dim() == 1 && meta.chunk_offsets.is_contiguous() &&
+                    meta.chunk_offsets.size(0) >= num_chunks + 1, "meta.chunk_offsets mismatch");
+        TORCH_CHECK(meta.chunk_valid_lens.is_cuda() && meta.chunk_valid_lens.device() == Y.device() &&
+                    meta.chunk_valid_lens.scalar_type() == at::ScalarType::Int &&
+                    meta.chunk_valid_lens.dim() == 1 && meta.chunk_valid_lens.is_contiguous() &&
+                    meta.chunk_valid_lens.size(0) >= num_chunks, "meta.chunk_valid_lens mismatch");
+    }
 
     bool has_grad_final = false;
     at::Tensor grad_final_states_c;
-
     if (grad_final_states.has_value() && grad_final_states.value().defined()) {
         const at::Tensor& gf_in = grad_final_states.value();
-        TORCH_CHECK(gf_in.is_cuda(), "grad_final_states must be a CUDA tensor");
-        TORCH_CHECK(gf_in.device() == W.device(), "grad_final_states must be on the same device as W");
-        TORCH_CHECK(gf_in.scalar_type() == at::ScalarType::Half, "grad_final_states must be FP16 (torch.float16)");
-        TORCH_CHECK(gf_in.dim() == 4 && gf_in.size(0) == batch_size && gf_in.size(1) == num_kv_heads
-                    && gf_in.size(2) == d_v && gf_in.size(3) == d_k,
-                    "grad_final_states must be (B, H, d_v, d_k)");
+        TORCH_CHECK(gf_in.is_cuda() && gf_in.device() == Y.device(),
+                    "grad_final_states must be on the same CUDA device as Y");
+        TORCH_CHECK(gf_in.scalar_type() == at::ScalarType::Float,
+                    "grad_final_states must be FP32 (torch.float32)");
+        TORCH_CHECK(gf_in.dim() == 4 && gf_in.size(0) == batch_size && gf_in.size(1) == num_kv_heads &&
+                    gf_in.size(2) == d_v && gf_in.size(3) == d_k,
+                    "grad_final_states must have shape (B, H_kv, 64, 64)");
         grad_final_states_c = ensure_aligned16(gf_in.contiguous());
         has_grad_final = true;
     }
 
-    auto options = W.options();
-    at::Tensor grad_Y = at::zeros_like(gS);
-    at::Tensor grad_state_old;
-
-    if (num_chunks == 0 || batch_size == 0) {
-        at::Tensor grad_W = at::zeros_like(W);
+    auto f_opts = dS_inout.options();
+    if (num_chunks <= 0 || batch_size == 0) {
+        at::Tensor grad_state_old;
         if (has_state_old) {
             if (batch_size == 0) {
-                grad_state_old = at::empty({0, num_kv_heads, d_v, d_k}, options);
+                grad_state_old = at::empty({0, num_kv_heads, d_v, d_k}, f_opts);
             } else if (has_grad_final) {
                 grad_state_old = grad_final_states_c.clone();
             } else {
-                grad_state_old = at::zeros({batch_size, num_kv_heads, d_v, d_k}, options);
+                grad_state_old = at::zeros({batch_size, num_kv_heads, d_v, d_k}, f_opts);
             }
-        } else {
-            grad_state_old = at::Tensor();
         }
-        return std::make_tuple(grad_W, grad_Y, grad_state_old);
+        return std::make_tuple(dS_inout, dR_inout, grad_state_old);
     }
 
-    if (has_state_old) {
-        grad_state_old = at::empty({batch_size, num_kv_heads, d_v, d_k}, options);
-    } else {
-        grad_state_old = at::Tensor();
-    }
+    at::Tensor grad_state_old = has_state_old
+        ? torch::empty({batch_size, num_kv_heads, d_v, d_k}, f_opts)
+        : at::Tensor();
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    at::Tensor Y_a = ensure_aligned16(Y);
+    at::Tensor k_a = ensure_aligned16(k_h);
+    at::Tensor G_a = ensure_aligned16(G_log2_h);
 
-    // Stage 2 - Reverse Time Scan Kernel Launch
+    bool ds_aligned = (dS_inout.numel() == 0) || ((reinterpret_cast<uintptr_t>(dS_inout.data_ptr()) & 15) == 0);
+    at::Tensor dS_work = ds_aligned ? dS_inout : dS_inout.clone();
+    bool dr_aligned = (dR_inout.numel() == 0) || ((reinterpret_cast<uintptr_t>(dR_inout.data_ptr()) & 15) == 0);
+    at::Tensor dR_work = dr_aligned ? dR_inout : dR_inout.clone();
+
+    constexpr int NUM_THREADS = 128;
+    constexpr int CHUNK_CONST = 64;
+    constexpr int DK_CONST    = 64;
+    constexpr int DV_CONST    = 64;
+    constexpr int BV_CONST    = 16;
+
+    using Element    = cutlass::half_t;
+    using MMAAtom    = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
+    using TiledMMA411 = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>, Stride<_1, _4, _4>>>;
+    using TiledMMA141 = TiledMMA<MMAAtom, Layout<Shape<_1, _4, _1>, Stride<_1, _1, _4>>>;
+
+    using S2RCopyAtomA_KM  = Copy_Atom<SM75_U32x2_LDSM_N, Element>;
+    using S2RCopyAtomB_KM  = Copy_Atom<SM75_U32x1_LDSM_N, Element>;
+    using S2RCopyAtomA_MNM = Copy_Atom<SM75_U16x4_LDSM_T, Element>;
+    using S2RCopyAtomB_MNM = Copy_Atom<SM75_U16x2_LDSM_T, Element>;
+
+    using TiledCopyHalf = decltype(make_tiled_copy(
+        Copy_Atom<UniversalCopy<uint4>, Element>{},
+        Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+        Layout<Shape<_1, _8>, Stride<_8, _1>>{}
+    ));
+    using TiledCopyR = decltype(make_tiled_copy(
+        Copy_Atom<UniversalCopy<uint4>, Element>{},
+        Layout<Shape<_64, _2>, Stride<_2, _1>>{},
+        Layout<Shape<_1, _8>, Stride<_8, _1>>{}
+    ));
+    using TiledCopyFloat = decltype(make_tiled_copy(
+        Copy_Atom<UniversalCopy<uint4>, float>{},
+        Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+        Layout<Shape<_1, _8>, Stride<_8, _1>>{}
+    ));
+
+    float*         p_dS         = dS_work.data_ptr<float>();
+    Element*       p_dR         = reinterpret_cast<Element*>(dR_work.data_ptr<at::Half>());
+    const Element* p_Y          = reinterpret_cast<const Element*>(Y_a.data_ptr<at::Half>());
+    const Element* p_k          = reinterpret_cast<const Element*>(k_a.data_ptr<at::Half>());
+    const float*   p_G          = G_a.data_ptr<float>();
+    const float*   p_grad_final = has_grad_final ? grad_final_states_c.data_ptr<float>() : nullptr;
+    const int32_t* p_cu_c       = meta.cu_chunk_lens.data_ptr<int32_t>();
+    const int32_t* p_c_off      = meta.chunk_offsets.data_ptr<int32_t>();
+    const int32_t* p_c_vlen     = meta.chunk_valid_lens.data_ptr<int32_t>();
+    float*         p_grad_old   = has_state_old ? grad_state_old.data_ptr<float>() : nullptr;
+
     {
-        using T = cutlass::half_t;
-
-        at::Tensor W_a           = ensure_aligned16(W);
-        const T* p_grad_s_list   = reinterpret_cast<const T*>(gS.data_ptr<at::Half>());
-        const T* p_w             = reinterpret_cast<const T*>(W_a.data_ptr<at::Half>());
-        const T* p_grad_final    = has_grad_final ? reinterpret_cast<const T*>(grad_final_states_c.data_ptr<at::Half>()) : nullptr;
-        const int32_t* p_cu_chunk_lens = cu_chunk_lens_i32.data_ptr<int32_t>();
-
-        T* p_grad_y         = reinterpret_cast<T*>(grad_Y.data_ptr<at::Half>());
-        T* p_grad_state_old = has_state_old ? reinterpret_cast<T*>(grad_state_old.data_ptr<at::Half>()) : nullptr;
-
-        constexpr int NUM_THRDS    = 128;
-        constexpr int DK_DIM       = 64;
-        constexpr int DV_DIM       = 64;
-        constexpr int BV_DIM       = 16;
-        constexpr int ROWS_PER_STP = 16;
-
-        using MMAAtomOp = SM75_16x8x8_F32F16F16F32_TN;
-        using MMAAtom   = MMA_Atom<MMAAtomOp>;
-        using TiledMMA  = TiledMMA<MMAAtom, Layout<Shape<_1, _4, _1>, Stride<_1, _1, _4>>>;
-
-        using S2RCopyAtomA = Copy_Atom<SM75_U32x2_LDSM_N, T>;
-        using S2RCopyAtomB = Copy_Atom<SM75_U32x1_LDSM_N, T>;
-
-        using CopyAtom = Copy_Atom<UniversalCopy<uint4>, T>;
-        using TiledCopyG2R = decltype(make_tiled_copy(
-            CopyAtom{},
-            make_layout(make_shape(Int<ROWS_PER_STP>{}, Int<DK_DIM / 8>{}), LayoutRight{}),
-            make_layout(make_shape(Int<1>{}, Int<8>{}), LayoutRight{})
-        ));
-        using TiledCopyStore = TiledCopyG2R;
-
-        dim3 grid(batch_size, num_kv_heads, DV_DIM / BV_DIM);
-        dim3 block(NUM_THRDS);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        dim3 grid(
+            static_cast<unsigned int>(batch_size),
+            static_cast<unsigned int>(num_kv_heads),
+            static_cast<unsigned int>(DV_CONST / BV_CONST)
+        );
+        dim3 block(NUM_THREADS);
 
         kernel_chunk_scan_bwd<
-            T, NUM_THRDS, DK_DIM, DV_DIM, BV_DIM,
-            MMAAtom, TiledMMA, S2RCopyAtomA, S2RCopyAtomB,
-            TiledCopyG2R, TiledCopyStore
+            Element, NUM_THREADS, CHUNK_CONST, DK_CONST, DV_CONST, BV_CONST,
+            MMAAtom, TiledMMA411, TiledMMA141,
+            S2RCopyAtomA_KM, S2RCopyAtomB_KM, S2RCopyAtomA_MNM, S2RCopyAtomB_MNM,
+            TiledCopyHalf, TiledCopyR, TiledCopyFloat
         ><<<grid, block, 0, stream>>>(
-            p_grad_s_list,
-            p_w,
-            p_grad_final,
-            p_cu_chunk_lens,
-            p_grad_y,
-            p_grad_state_old,
-            has_state_old,
-            num_chunks,
-            batch_size
+            p_dS, p_dR, p_Y, p_k, p_G, p_grad_final,
+            p_cu_c, p_c_off, p_c_vlen,
+            p_grad_old, has_state_old, total_L, num_chunks
         );
-
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // Stage 3 - Compute grad_W via Batched GEMM (at::bmm) on Host
-    // Parallel GEMM (dW = S^T @ dY) across all chunks via cuBLAS bmm:
-    // S_list: (num_kv_heads, num_chunks, d_v, d_k) -> flatten(0, 1) -> transpose(-1, -2) -> (H*C, d_k, d_v)
-    // grad_Y: (num_kv_heads, num_chunks, d_v, d_k) -> flatten(0, 1) -> (H*C, d_v, d_k)
-    // bmm: (H*C, d_k, d_v) @ (H*C, d_v, d_k) -> (H*C, d_k, d_k) -> view_as(W)
-    at::Tensor grad_W = at::bmm(
-        S_list.flatten(0, 1).transpose(-1, -2),
-        grad_Y.flatten(0, 1)
-    ).view_as(W);
+    if (!ds_aligned) {
+        dS_inout.copy_(dS_work);
+    }
+    if (!dr_aligned) {
+        dR_inout.copy_(dR_work);
+    }
 
-    // Stage 4 - Return Results
-    return std::make_tuple(grad_W, grad_Y, grad_state_old);
+    return std::make_tuple(dS_inout, dR_inout, grad_state_old);
+}
+
+// Outputs: (dS_next_list: (H_kv, num_chunks, 64, 64) [FP32 in-place], dR_total: (H_kv, num_chunks, 64, 64) [FP16 in-place], grad_state_old: (B, H_kv, 64, 64) [FP32])
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+chunk_scan_bwd(
+    at::Tensor& dS_inout,
+    at::Tensor& dR_inout,
+    const at::Tensor& Y,
+    const at::Tensor& k_h,
+    const at::Tensor& G_log2_h,
+    const at::Tensor& cu_seq_lens,
+    const std::optional<at::Tensor>& grad_final_states,
+    bool has_state_old,
+    int64_t chunk_size
+) {
+    TORCH_CHECK(chunk_size == 64, "chunk_size must be 64");
+    TORCH_CHECK(cu_seq_lens.is_cuda() && cu_seq_lens.dim() == 1 && cu_seq_lens.size(0) >= 1,
+                "cu_seq_lens must be a 1D CUDA tensor with size >= 1");
+    int64_t batch_size = cu_seq_lens.size(0) - 1;
+    VarlenChunkMeta meta = compute_varlen_chunk_metadata(cu_seq_lens, chunk_size);
+    return chunk_scan_bwd_with_meta(
+        dS_inout, dR_inout, Y, k_h, G_log2_h, meta, batch_size, grad_final_states, has_state_old, chunk_size
+    );
 }

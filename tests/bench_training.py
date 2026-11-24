@@ -86,6 +86,18 @@ def _compile_or_none(target: Any, label: str):
         return None
 
 
+class _RefTrainModule(torch.nn.Module):
+    """Pure-PyTorch wrapper so torch.compile traces only the eager reference path."""
+
+    def __init__(self, block: DeltaBlock) -> None:
+        super().__init__()
+        self.block = block
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y, _, _ = self.block(x, use_kernel=False)
+        return y
+
+
 def run_training_benchmark(
     d_model: int = 768,
     num_q_heads: int = 8,
@@ -97,41 +109,45 @@ def run_training_benchmark(
     seq_lens: Optional[List[int]] = None,
     num_warmup: int = 3,
     num_iters: int = 10,
-    use_short_conv: bool = False,
+    use_short_conv: bool = True,
     include_compile: bool = True,
+    include_external: bool = True,
     dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
 ):
-    """Part A: Benchmark pure token-mixer training step across sequence lengths."""
+    """Part A: Benchmark pure token-mixer training step (PyTorch eager & compiled first, then optional FLA/NVLabs)."""
     device = device or get_device()
     seq_lens = seq_lens or [512, 1024, 2048, 4096]
 
-    print_section("PART A: TRAINING BENCHMARK (PURE TOKEN MIXER VS OPEN-SOURCE BASELINES)")
+    print_section("PART A: TRAINING BENCHMARK (PURE TOKEN MIXER VS BASELINES)")
     print(
         f"Config: d_model={d_model}, H_q={num_q_heads}, H_kv={num_kv_heads}, "
-        f"d_k={d_k}, d_v={d_v}, chunk={chunk_size}, B={batch_size}, dtype={dtype}"
+        f"d_k={d_k}, d_v={d_v}, chunk={chunk_size}, conv={use_short_conv}, B={batch_size}, dtype={dtype}"
     )
 
     our_block = DeltaBlock(
         d_model=d_model, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
         d_k=d_k, d_v=d_v, chunk_size=chunk_size, hidden_dim=None,
     ).to(device=device, dtype=dtype).train()
-    our_compiled = _compile_or_none(our_block, "DeltaBlock-kernel") if include_compile else None
+    ref_wrapper = _RefTrainModule(our_block)
+    ref_compiled = _compile_or_none(ref_wrapper, "PyTorch-Ref-Train") if include_compile else None
 
-    baselines = [
-        ("FLA GatedDeltaNet (v1)", _try_init_train_baseline(
-            try_import_fla_gdn(), "FLA GatedDeltaNet (v1)",
-            d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
-        )),
-        ("FLA GatedDeltaNet-2", _try_init_train_baseline(
-            try_import_fla_gdn2(), "FLA GatedDeltaNet-2",
-            d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
-        )),
-        ("NVLabs GatedDeltaNet-2", _try_init_train_baseline(
-            try_import_nvlabs_gdn2(), "NVLabs GatedDeltaNet-2",
-            d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
-        )),
-    ]
+    baselines = []
+    if include_external:
+        baselines = [
+            ("FLA GatedDeltaNet (v1)", _try_init_train_baseline(
+                try_import_fla_gdn(), "FLA GatedDeltaNet (v1)",
+                d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
+            )),
+            ("FLA GatedDeltaNet-2", _try_init_train_baseline(
+                try_import_fla_gdn2(), "FLA GatedDeltaNet-2",
+                d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
+            )),
+            ("NVLabs GatedDeltaNet-2", _try_init_train_baseline(
+                try_import_nvlabs_gdn2(), "NVLabs GatedDeltaNet-2",
+                d_model, num_kv_heads, d_k, d_v, use_short_conv, device, dtype,
+            )),
+        ]
 
     headers = [
         "SeqLen (L)", "Tokens (B*L)", "Method / Implementation",
@@ -159,7 +175,7 @@ def run_training_benchmark(
             rs = measure_performance(fn_step, num_warmup, num_iters, device)
             return rf, rs
 
-        # 1. PyTorch Reference
+        # 1. PyTorch Reference (Unfused Eager)
         def _ref_fwd():
             with torch.no_grad():
                 return our_block(x_batched, use_kernel=False)
@@ -167,7 +183,7 @@ def run_training_benchmark(
         def _ref_step():
             our_block.zero_grad(set_to_none=True)
             x_batched.grad = None
-            out, _ = our_block(x_batched, use_kernel=False)
+            out, _, _ = our_block(x_batched, use_kernel=False)
             out.sum().backward()
 
         rf_ref, rs_ref = _measure_pair("PyTorch Reference", _ref_fwd, _ref_step)
@@ -206,7 +222,36 @@ def run_training_benchmark(
 
         _append_result("PyTorch Reference (Unfused)", rf_ref, rs_ref)
 
-        # 2. External baselines
+        # 2. PyTorch Reference (Compiled with TorchInductor)
+        if ref_compiled is not None:
+            def _ref_c_fwd():
+                with torch.no_grad():
+                    return ref_compiled(x_batched)
+
+            def _ref_c_step():
+                our_block.zero_grad(set_to_none=True)
+                x_batched.grad = None
+                out = ref_compiled(x_batched)
+                out.sum().backward()
+
+            rf_rc, rs_rc = _measure_pair("PyTorch Reference (Compiled)", _ref_c_fwd, _ref_c_step)
+            _append_result("PyTorch Reference (Compiled)", rf_rc, rs_rc)
+
+        # 3. DeltaNet v2 (Ours - Base CUDA/CuTe Kernel, checked right after PyTorch!)
+        def _ours_fwd():
+            with torch.no_grad():
+                return our_block(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
+
+        def _ours_step():
+            our_block.zero_grad(set_to_none=True)
+            x_packed.grad = None
+            out, _, _ = our_block(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
+            out.sum().backward()
+
+        rf_o, rs_o = _measure_pair("DeltaNet v2 (Ours)", _ours_fwd, _ours_step)
+        _append_result("DeltaNet v2 (Ours)", rf_o, rs_o, bold=True)
+
+        # 4. External baselines (optional, run after fast PyTorch/TorchCompile vs Ours comparison)
         for bname, bmod in baselines:
             if bmod is None:
                 continue
@@ -223,35 +268,6 @@ def run_training_benchmark(
 
             rf_b, rs_b = _measure_pair(bname, _b_fwd, _b_step)
             _append_result(bname, rf_b, rs_b)
-
-        # 3. DeltaNet v2 (Ours - Eager)
-        def _ours_fwd():
-            with torch.no_grad():
-                return our_block(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
-
-        def _ours_step():
-            our_block.zero_grad(set_to_none=True)
-            x_packed.grad = None
-            out, _ = our_block(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
-            out.sum().backward()
-
-        rf_o, rs_o = _measure_pair("DeltaNet v2 (Ours)", _ours_fwd, _ours_step)
-        _append_result("DeltaNet v2 (Ours)", rf_o, rs_o, bold=True)
-
-        # 4. DeltaNet v2 (Ours - torch.compile)
-        if our_compiled is not None:
-            def _ours_c_fwd():
-                with torch.no_grad():
-                    return our_compiled(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
-
-            def _ours_c_step():
-                our_block.zero_grad(set_to_none=True)
-                x_packed.grad = None
-                out, _ = our_compiled(x_packed, cu_seqlens=cu_seqlens, use_kernel=True)
-                out.sum().backward()
-
-            rf_oc, rs_oc = _measure_pair("DeltaNet v2 (Compiled)", _ours_c_fwd, _ours_c_step)
-            _append_result("DeltaNet v2 (Compiled)", rf_oc, rs_oc, bold=True)
 
         del x_batched, x_packed, cu_seqlens
         gc.collect()
@@ -277,10 +293,11 @@ def run_e2e_training_benchmark(
     batch_sizes: Optional[List[int]] = None,
     num_warmup: int = 3,
     num_iters: int = 8,
+    include_compile: bool = True,
     dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
 ):
-    """Part B: End-to-End DeltaBlock (with MLP) training vs torch.compile."""
+    """Part B: End-to-End DeltaBlock (PreNorm + SwiGLU MLP) training vs torch.compile."""
     device = device or get_device()
     batch_sizes = batch_sizes or [4, 8, 16]
     hidden_dim = d_model * 4
@@ -297,10 +314,10 @@ def run_e2e_training_benchmark(
 
     modes = [
         ("torch-eager", False, False),
-        ("torch-compiled", False, True),
-        ("kernel-eager", True, False),
-        ("kernel-compiled", True, True),
     ]
+    if include_compile:
+        modes.append(("torch-compiled", False, True))
+    modes.append(("kernel", True, False))
 
     for B in batch_sizes:
         total_tokens = B * seq_len
@@ -313,7 +330,7 @@ def run_e2e_training_benchmark(
                 d_model=d_model, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
                 d_k=d_k, d_v=d_v, chunk_size=chunk_size, hidden_dim=hidden_dim,
             ).to(device=device, dtype=dtype).train()
-            fn = _compile_or_none(blk, mname) if do_comp else blk
+            fn = _compile_or_none(_RefTrainModule(blk), mname) if do_comp else blk
             if fn is None:
                 rows.append([B, mname, "COMPILE_ERR", "-", "-", "-"])
                 records.append({"B": B, "mode": mname, "step_ms": None, "tok_s": None, "peak_gb": None, "status": "COMPILE_ERR"})
@@ -329,7 +346,12 @@ def run_e2e_training_benchmark(
             def _step():
                 blk.zero_grad(set_to_none=True)
                 x.grad = None
-                out, _ = fn(x, cu_seqlens=cu, use_kernel=True) if use_k else fn(x, use_kernel=False)
+                if do_comp:
+                    out = fn(x)
+                elif use_k:
+                    out, _, _ = fn(x, cu_seqlens=cu, use_kernel=True)
+                else:
+                    out, _, _ = fn(x, use_kernel=False)
                 out.sum().backward()
 
             res = measure_performance(_step, num_warmup, num_iters, device)
@@ -341,7 +363,7 @@ def run_e2e_training_benchmark(
                     eager_ms = lat
                 sp = f"{eager_ms / lat:.2f}x" if (eager_ms > 0 and lat > 0) else "-"
                 print(f"  [B={B}] {mname:<15}: {lat:6.1f} ms | {tok_s:8,.0f} tok/s | {peak_gb:.2f} GB ({sp})")
-                bold = (mname == "kernel-compiled")
+                bold = (mname == "kernel")
                 w = (lambda s: f"**{s}**") if bold else (lambda s: s)
                 rows.append([B, w(mname), w(f"{lat:.1f}"), w(f"{tok_s:,.0f}"), w(f"{peak_gb:.2f}"), w(sp)])
                 records.append({"B": B, "mode": mname, "step_ms": lat, "tok_s": tok_s, "peak_gb": peak_gb, "status": "OK"})
@@ -378,11 +400,11 @@ def _save_training_plot(
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     methods = [
         ("PyTorch Reference (Unfused)", "#6c757d"),
+        ("PyTorch Reference (Compiled)", "#0ea5e9"),
         ("FLA GatedDeltaNet (v1)", "#3b82f6"),
         ("FLA GatedDeltaNet-2", "#8b5cf6"),
         ("NVLabs GatedDeltaNet-2", "#f59e0b"),
         ("DeltaNet v2 (Ours)", "#10b981"),
-        ("DeltaNet v2 (Compiled)", "#047857"),
     ]
     active_methods = [(m, c) for m, c in methods if any(r["method"] == m and r["status"] == "OK" for r in part_a)]
     seq_lens = sorted({r["seq_len"] for r in part_a})
@@ -391,13 +413,13 @@ def _save_training_plot(
     nrows = 2 if part_b else 1
     fig, axes = plt.subplots(nrows, ncols, figsize=(15, 5.2 * nrows))
     axes_2d = axes.reshape(nrows, ncols)
-    fig.suptitle("DeltaNet v2 Training Benchmark (NVIDIA Turing SM75, FP16)", fontsize=13, fontweight="bold")
+    fig.suptitle("Gated DeltaNet-2 Training Benchmark (NVIDIA Turing SM75, FP16)", fontsize=13, fontweight="bold")
 
     x = np.arange(len(seq_lens))
     n_m = max(len(active_methods), 1)
     width = 0.78 / n_m
 
-    # Panel 1: Fwd+Bwd Latency vs Open-Source Baselines
+    # Panel 1: Fwd+Bwd Latency
     ax1 = axes_2d[0, 0]
     ax2 = axes_2d[0, 1]
     for idx, (m, color) in enumerate(active_methods):
@@ -428,14 +450,15 @@ def _save_training_plot(
         e2e_modes = [
             ("torch-eager", "#6c757d"),
             ("torch-compiled", "#3b82f6"),
-            ("kernel-eager", "#f59e0b"),
-            ("kernel-compiled", "#10b981"),
+            ("kernel", "#10b981"),
         ]
-        wb = 0.19
+        active_e2e = [(m, c) for m, c in e2e_modes if any(r["mode"] == m and r["status"] == "OK" for r in part_b)]
+        n_e = max(len(active_e2e), 1)
+        wb = 0.72 / n_e
         ax3 = axes_2d[1, 0]
         ax4 = axes_2d[1, 1]
-        for idx, (m, color) in enumerate(e2e_modes):
-            offs = xb + (idx - 1.5) * wb
+        for idx, (m, color) in enumerate(active_e2e):
+            offs = xb + (idx - (n_e - 1) / 2.0) * wb
             toks = [next((r["tok_s"] or 0.0 for r in part_b if r["B"] == b and r["mode"] == m), 0.0) for b in batches]
             gbs = [next((r["peak_gb"] or 0.0 for r in part_b if r["B"] == b and r["mode"] == m), 0.0) for b in batches]
             ax3.bar(offs, toks, width=wb, label=m, color=color)
@@ -475,9 +498,10 @@ def parse_args():
     parser.add_argument("--e2e-seq-len", type=int, default=1024, help="Sequence length for Part B E2E (default: 1024)")
     parser.add_argument("--warmup", type=int, default=3, help="Number of warmup iterations (default: 3)")
     parser.add_argument("--iters", type=int, default=10, help="Number of timed iterations (default: 10)")
-    parser.add_argument("--use-conv", action="store_true", help="Enable ShortConvolution in baselines")
+    parser.add_argument("--no-conv", action="store_true", help="Disable ShortConvolution in external baselines")
+    parser.add_argument("--skip-external", action="store_true", help="Only run fast PyTorch eager + torch.compile vs Ours (skip slow FLA/NVLabs)")
     parser.add_argument("--skip-e2e", action="store_true", help="Skip Part B E2E DeltaBlock benchmark")
-    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile variants")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile baselines")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 instead of float16")
     parser.add_argument("--save-md", type=str, default=None, help="Save markdown tables to file")
     parser.add_argument("--save-json", type=str, default=None, help="Save benchmark results as JSON")
@@ -488,7 +512,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     print_hardware_info()
-    print_baseline_status()
+    if not args.skip_external:
+        print_baseline_status()
 
     l_list = [int(s.strip()) for s in args.seq_lens.split(",") if s.strip()]
     e2e_b_list = [int(b.strip()) for b in args.e2e_batches.split(",") if b.strip()]
@@ -498,8 +523,10 @@ if __name__ == "__main__":
         d_model=args.dim, num_q_heads=args.q_heads, num_kv_heads=args.kv_heads,
         d_k=args.d_k, d_v=args.d_v, chunk_size=args.chunk_size,
         batch_size=args.batch_size, seq_lens=l_list, num_warmup=args.warmup,
-        num_iters=args.iters, use_short_conv=args.use_conv,
-        include_compile=not args.no_compile, dtype=dtype,
+        num_iters=args.iters, use_short_conv=not args.no_conv,
+        include_compile=not args.no_compile,
+        include_external=not args.skip_external,
+        dtype=dtype,
     )
 
     part_b_rec, part_b_md = None, ""
@@ -509,7 +536,8 @@ if __name__ == "__main__":
             d_model=args.dim, num_q_heads=args.q_heads, num_kv_heads=e2e_hkv,
             d_k=args.d_k, d_v=args.d_v, chunk_size=args.chunk_size,
             seq_len=args.e2e_seq_len, batch_sizes=e2e_b_list,
-            num_warmup=args.warmup, num_iters=max(5, args.iters), dtype=dtype,
+            num_warmup=args.warmup, num_iters=max(5, args.iters),
+            include_compile=not args.no_compile, dtype=dtype,
         )
 
     if args.save_md:

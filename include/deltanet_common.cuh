@@ -12,6 +12,8 @@
 
 #include <torch/extension.h>
 
+#include "deltanet_ops.cuh"
+
 using namespace cute;
 
 // Gated DeltaNet-2 constants for log2 decay and beta-guard projection
@@ -317,16 +319,6 @@ inline std::tuple<at::Tensor, at::Tensor, int64_t> compute_chunk_offsets_and_val
 
     return std::make_tuple(chunk_offsets_gpu, chunk_valid_lens_gpu, num_chunks);
 }
-
-struct VarlenChunkMeta {
-    at::Tensor chunk_offsets;      // (num_chunks + 1,) [Int32, CUDA]
-    at::Tensor chunk_valid_lens;   // (num_chunks,) [Int32, CUDA]
-    at::Tensor chunk_seq_ids;      // (num_chunks,) [Int32, CUDA]
-    at::Tensor chunk_local_starts; // (num_chunks,) [Int32, CUDA]
-    at::Tensor chunk_is_last;      // (num_chunks,) [Int32, CUDA]
-    at::Tensor cu_chunk_lens;      // (batch_size + 1,) [Int32, CUDA]
-    int64_t num_chunks;
-};
 
 inline VarlenChunkMeta compute_varlen_chunk_metadata(
     const at::Tensor& cu_seq_lens,

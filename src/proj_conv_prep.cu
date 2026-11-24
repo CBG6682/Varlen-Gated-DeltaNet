@@ -1276,7 +1276,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_gates_decay_transpos
 // Part 2: Host Dispatch Helpers and PyTorch Entry Points
 // ============================================================================
 
-namespace {
+namespace proj_conv_prep_detail {
 
 using TiledCopyChunkHalf = decltype(make_tiled_copy(
     Copy_Atom<UniversalCopy<uint4>, cutlass::half_t>{},
@@ -1449,7 +1449,8 @@ inline void launch_gates_decay_fwd(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-} // namespace
+} // namespace proj_conv_prep_detail
+using namespace proj_conv_prep_detail;
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 proj_conv_prep_fwd_with_meta(

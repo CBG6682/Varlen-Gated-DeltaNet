@@ -1505,7 +1505,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_residual_add_fwd(
 // Part 2: Host Dispatch Helpers and PyTorch Entry Points
 // ============================================================================
 
-namespace {
+namespace block_ops_detail {
 
 template <int NUM_THREADS>
 using RowTiledCopyHalf = decltype(make_tiled_copy(
@@ -1693,7 +1693,8 @@ inline void launch_residual_rmsnorm_bwd_tile(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-} // namespace
+} // namespace block_ops_detail
+using namespace block_ops_detail;
 
 // Outputs: (out: (L, D) [FP16], rstd: (L,) [FP32] or empty when !is_training)
 std::tuple<at::Tensor, at::Tensor>

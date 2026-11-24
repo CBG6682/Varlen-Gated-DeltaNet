@@ -5,7 +5,15 @@
 #include <tuple>
 #include <vector>
 
-#include "deltanet_common.cuh"
+struct VarlenChunkMeta {
+    at::Tensor chunk_offsets;      // (num_chunks + 1,) [Int32, CUDA]
+    at::Tensor chunk_valid_lens;   // (num_chunks,) [Int32, CUDA]
+    at::Tensor chunk_seq_ids;      // (num_chunks,) [Int32, CUDA]
+    at::Tensor chunk_local_starts; // (num_chunks,) [Int32, CUDA]
+    at::Tensor chunk_is_last;      // (num_chunks,) [Int32, CUDA]
+    at::Tensor cu_chunk_lens;      // (batch_size + 1,) [Int32, CUDA]
+    int64_t num_chunks;
+};
 
 // DeltaNet v2 operator declarations (CuTe Tensor / SM75+).
 // Packed token-major DeltaBlock API + head-first core kernels with FP32 recurrent state.

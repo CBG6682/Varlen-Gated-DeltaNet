@@ -347,7 +347,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_deltanet_infer(
     }
 }
 
-namespace {
+namespace deltanet_infer_detail {
 
 template <bool ALLOW_NEG_EIGVAL, bool BETA_GUARD>
 inline void launch_deltanet_infer(
@@ -402,7 +402,8 @@ inline void launch_deltanet_infer(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-} // namespace
+} // namespace deltanet_infer_detail
+using namespace deltanet_infer_detail;
 
 // ============================================================================
 // Part 2: Host Dispatch Function (deltablock_infer)

@@ -1143,9 +1143,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_intra_dqk_b
                 __syncthreads();
             }
 
-            // Diagonal (i, i) contribution in FP32
+            // Diagonal (i, i) strictly off-diagonal contribution in FP32 (s == row_id has dG = 0)
             for (int s = 0; s < SUB_CHUNK; ++s) {
-                if (s <= row_id && row_id < i_valid) {
+                if (s < row_id && row_id < i_valid) {
                     float da = half_to_float(s2_dAqk(i_start + row_id, i_start + s));
                     #pragma unroll
                     for (int v = 0; v < 8; ++v) {
@@ -1156,7 +1156,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_intra_dqk_b
                 }
             }
 
-            // Accumulate dQ_intra -> gDQ_h and +q * dQ_intra -> gDG_ext
+            // Accumulate dQ_intra -> gDQ_h and off-diagonal +q * dQ_intra -> gDG_ext
             auto gDQ_sub = make_tensor(make_gmem_ptr(gDQ_h     + q_i_off),  layout_sub_gmem);
             auto gQi_sub = make_tensor(make_gmem_ptr(gQ_h      + q_i_off),  layout_sub_gmem);
             auto gDG_sub = make_tensor(make_gmem_ptr(gDG_ext   + kv_i_off), layout_sub_gmem);
@@ -1174,10 +1174,13 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_intra_dqk_b
                 cute::copy_if(tiled_copy_f32, tPredF32Sub,  thr_copy_f32.partition_S(gDG_sub), tCrGSub);
             }
 
+            // Add diagonal (s == row_id) dQ directly to gDQ_h without cancelling in gDG_ext
+            float da_diag = (row_id < i_valid) ? half_to_float(s2_dAqk(i_start + row_id, i_start + row_id)) : 0.0f;
             #pragma unroll
             for (int v = 0; v < 8; ++v) {
+                float dq_diag = da_diag * half_to_float(sSubB(row_id, col_base + v));
                 tCrSubA(v, Int<0>{}, Int<0>{}) = float_to_out<T>(
-                    half_to_float(tCrSubA(v, Int<0>{}, Int<0>{})) + dq_acc[v]
+                    half_to_float(tCrSubA(v, Int<0>{}, Int<0>{})) + dq_acc[v] + dq_diag
                 );
                 tCrGSub(v, Int<0>{}, Int<0>{}) += half_to_float(tCrSubB(v, Int<0>{}, Int<0>{})) * dq_acc[v];
             }
@@ -1229,9 +1232,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_intra_dqk_b
 
             float dk_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-            // Diagonal (j, j) contribution in FP32
+            // Diagonal (j, j) strictly off-diagonal contribution in FP32 (r == row_id has dG = 0)
             for (int r = 0; r < SUB_CHUNK; ++r) {
-                if (r >= row_id && r < j_valid && row_id < j_valid) {
+                if (r > row_id && r < j_valid && row_id < j_valid) {
                     float da = half_to_float(s2_dAqk(j_start + r, j_start + row_id));
                     #pragma unroll
                     for (int v = 0; v < 8; ++v) {
@@ -1344,6 +1347,13 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_intra_dqk_b
                 cute::copy(tiled_copy_f32, tCrGSub, thr_copy_f32.partition_D(gDG_sub));
             } else {
                 cute::copy_if(tiled_copy_f32, tPredF32Sub, tCrGSub, thr_copy_f32.partition_D(gDG_sub));
+            }
+
+            // Add diagonal (r == row_id) dK after gDG_sub update so dG_intra sees zero diagonal cancellation
+            float da_diag = (row_id < j_valid) ? half_to_float(s2_dAqk(j_start + row_id, j_start + row_id)) : 0.0f;
+            #pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                dk_acc[v] += da_diag * half_to_float(sSubB(row_id, col_base + v));
             }
 
             if (num_groups == 1) {

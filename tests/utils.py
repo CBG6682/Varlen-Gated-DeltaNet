@@ -703,12 +703,20 @@ def check_dual_precision(
             return "PASS", ratio
         return "PASS", None
 
-    tag, r_main = _eval_one(kr, br, abs_cap)
-    r_grp = None
-    if kw is not None:
-        tag_w, r_grp = _eval_one(kw, bw, abs_cap_group)
-        if tag_w == "FAIL":
-            tag = "FAIL"
+    truth_zero = (truth_val.numel() > 0) and (
+        truth_val.detach().double().abs().max().item() <= 1e-12
+    )
+    if truth_zero:
+        tag = "PASS" if km <= 1e-5 else "FAIL"
+        r_main = None
+        r_grp = None
+    else:
+        tag, r_main = _eval_one(kr, br, abs_cap)
+        r_grp = None
+        if kw is not None:
+            tag_w, r_grp = _eval_one(kw, bw, abs_cap_group)
+            if tag_w == "FAIL":
+                tag = "FAIL"
 
     passed = tag != "FAIL"
     if verbose:

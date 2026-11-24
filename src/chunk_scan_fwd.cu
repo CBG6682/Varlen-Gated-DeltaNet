@@ -144,9 +144,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_chunk_scan_fwd(
     auto cTile64    = make_identity_tensor(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}));
     auto tXcK       = thr_copy_h.partition_S(cTile64);
     auto tXcG       = thr_copy_f32.partition_S(cTile64);
-    auto tCrG       = make_fragment_like<float>(tXcG);
+    auto tCrG       = make_tensor<float>(shape(tXcG));
     auto tPredK     = make_fragment_like<bool>(tXsMat_d);
-    auto tPredG     = make_fragment_like<bool>(tXcG);
+    auto tPredG     = make_tensor<bool>(shape(tXcG));
 
     int32_t last_valid_len = chunk_valid_lens[end_c - 1];
     if (last_valid_len < CHUNK_SIZE) {

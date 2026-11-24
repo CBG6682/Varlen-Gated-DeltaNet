@@ -333,7 +333,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dR_dS_dQint
     auto cTile64     = make_identity_tensor(make_shape(Int<CHUNK_SIZE>{}, Int<D_K>{}));
     auto tXcHalf64   = thr_copy_h.partition_S(cTile64);
     auto tXcF32_64   = thr_copy_f32.partition_S(cTile64);
-    auto tCrG64      = make_fragment_like<float>(tXcF32_64);
+    auto tCrG64      = make_tensor<float>(shape(tXcF32_64));
     auto tPredHalf64 = make_fragment_like<bool>(tCrBuf0);
     auto tPredF32_64 = make_fragment_like<bool>(tCrG64);
 
@@ -365,7 +365,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_dR_dS_dQint
     auto cSub16       = make_identity_tensor(make_shape(Int<SUB_CHUNK>{}, Int<D_K>{}));
     auto tXcHalfSub   = thr_copy_h.partition_S(cSub16);
     auto tXcF32Sub    = thr_copy_f32.partition_S(cSub16);
-    auto tCrGSub      = make_fragment_like<float>(tXcF32Sub);
+    auto tCrGSub      = make_tensor<float>(shape(tXcF32Sub));
     auto tPredHalfSub = make_fragment_like<bool>(tCrSubA);
     auto tPredF32Sub  = make_fragment_like<bool>(tCrGSub);
 
@@ -936,8 +936,8 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_output_combine_intra_dqk_b
     auto cSub16       = make_identity_tensor(make_shape(Int<SUB_CHUNK>{}, Int<D_K>{}));
     auto tXcHalfSub   = thr_copy_h.partition_S(cSub16);
     auto tXcF32Sub    = thr_copy_f32.partition_S(cSub16);
-    auto tCrGSub      = make_fragment_like<float>(tXcF32Sub);
-    auto tCrGSubAlt   = make_fragment_like<float>(tXcF32Sub);
+    auto tCrGSub      = make_tensor<float>(shape(tXcF32Sub));
+    auto tCrGSubAlt   = make_tensor<float>(shape(tXcF32Sub));
     auto tPredHalfSub = make_fragment_like<bool>(tCrSubA);
     auto tPredF32Sub  = make_fragment_like<bool>(tCrGSub);
 

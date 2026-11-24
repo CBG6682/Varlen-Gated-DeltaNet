@@ -132,7 +132,7 @@ proj_conv_prep_bwd(
     const at::Tensor& dv_h,                          // (num_kv_heads, total_L, d_v) [FP16] - Grad v_h
     const at::Tensor& db_h,                          // (num_kv_heads, total_L, d_k) [FP16] - Grad b_eff_h
     const at::Tensor& dw_h,                          // (num_kv_heads, total_L, d_v) [FP16] - Grad w_h
-    const at::Tensor& dG_h,                          // (num_kv_heads, total_L, d_k) [FP32] - Grad G_log2_h
+    const at::Tensor& dG_h,                          // (num_kv_heads, total_L, d_k) [FP32] - Grad G_ln_h (natural-log decay)
     const at::Tensor& proj,                          // (total_L, total_proj_dim) [FP16] - Saved projection
     const at::Tensor& conv_weight,                   // (conv_size, D_qkv) [FP16] - Conv weights
     const at::Tensor& A_log,                         // (num_kv_heads,) [FP32] - Log-decay rate

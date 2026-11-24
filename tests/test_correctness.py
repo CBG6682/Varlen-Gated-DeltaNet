@@ -490,7 +490,7 @@ def test_varlen_fwd_bwd_kernels(
             + (vr.float() * dv_g).sum()
             + (br.float() * db_g).sum()
             + (wr.float() * dw_g).sum()
-            + (Gr.float() * dG_g).sum()
+            + ((Gr.float() * math.log(2.0)) * dG_g).sum()
         )
         loss.backward()
         return pi.grad.detach(), cwi.grad.detach(), Ai.grad.detach(), dti.grad.detach(), pcsi.grad.detach()
@@ -882,13 +882,19 @@ def test_infer_decode_kernels(
         c_a = (torch.randn(16, 3, d_qkv_s, device=device) * 0.25).half().contiguous()
         base_y, base_s, base_c = m16_s(x_a, past_states=p_a.clone(), conv_state=c_a.clone(), use_kernel=True)
 
-        # 1) conv_state sensitivity
+        # 1) conv_state sensitivity (oldest tap shifts out; newest tap shifts into slot 1)
         c_mod = c_a.clone()
         c_mod[:, 0] += 0.5
         yc, _, cc = m16_s(x_a, past_states=p_a.clone(), conv_state=c_mod, use_kernel=True)
+        c_mod2 = c_a.clone()
+        c_mod2[:, 2] += 0.5
+        yc2, _, cc2 = m16_s(x_a, past_states=p_a.clone(), conv_state=c_mod2, use_kernel=True)
         _record(
             failures, tag_ab, "conv_state sensitivity",
-            (yc - base_y).abs().max().item() > 1e-3 and (cc - base_c).abs().max().item() > 1e-3,
+            (yc - base_y).abs().max().item() > 1e-3
+            and torch.equal(cc, base_c)
+            and (yc2 - base_y).abs().max().item() > 1e-3
+            and (cc2 - base_c).abs().max().item() > 1e-3,
         )
 
         # 2) channel-wise dt_bias sensitivity

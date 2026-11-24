@@ -1002,7 +1002,7 @@ template <
 __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_gates_decay_transpose_bwd(
     const T*       __restrict__ db_h_ptr,          // (H_kv, total_L, 64) [FP16] - Grad b_eff_h
     const T*       __restrict__ dw_h_ptr,          // (H_kv, total_L, 64) [FP16] - Grad w_h
-    const float*   __restrict__ dG_h_ptr,          // (H_kv, total_L, 64) [FP32] - Grad G_log2_h
+    const float*   __restrict__ dG_h_ptr,          // (H_kv, total_L, 64) [FP32] - Grad G_ln_h (natural-log decay)
     const T*       __restrict__ proj_ptr,          // (total_L, total_proj_dim) [FP16] - Saved projection
     const float*   __restrict__ A_log_ptr,         // (H_kv,) [FP32] - Log-decay rate
     const float*   __restrict__ dt_bias_ptr,       // (H_kv, 64) [FP32] - Decay bias

@@ -455,6 +455,34 @@ def test_varlen_fwd_bwd_kernels(
         _dual_check(failures, tag_pc, f"G_log2(neg={neg_eig})", Gk, Gb, Gt, lead_dims=2)
         _dual_check(failures, tag_pc, f"conv_s(bg={bguard})", csk, csb, cst, lead_dims=2)
 
+    # Regression: mixed beta_guard violations inside the same 4-row warp (SM75 warp-convergence safety)
+    cu_bg, _ = make_cu_seqlens([4], device)
+    proj_bg = torch.zeros(4, total_proj_p, device=device, dtype=torch.float16)
+    proj_bg[:, hq_p * 64 : d_qkv_p] = 0.5
+    off_b_bg = d_qkv_p
+    off_f_bg = d_qkv_p + 2 * hkv_p * 64
+    proj_bg[:, off_b_bg : off_b_bg + hkv_p * 64].view(4, hkv_p, 64)[..., :32] = 6.0
+    proj_bg[:, off_b_bg : off_b_bg + hkv_p * 64].view(4, hkv_p, 64)[..., 32:] = -6.0
+    proj_bg[0, off_f_bg : off_f_bg + hkv_p * 64] = -12.0   # row 0 triggers beta_guard
+    proj_bg[1:, off_f_bg : off_f_bg + hkv_p * 64] = 6.0    # rows 1..3 in same warp do not
+    cw_bg = torch.zeros(4, d_qkv_p, device=device, dtype=torch.float16)
+    cw_bg[3, :] = 1.0
+    Alog_bg = torch.zeros(hkv_p, device=device, dtype=torch.float32)
+    dt_bg = torch.zeros(hkv_p, 64, device=device, dtype=torch.float32)
+    _, _, _, bk_div, _, _, _, _, _ = custom_ops.proj_conv_prep_fwd(
+        proj_bg, cw_bg, Alog_bg, dt_bg, None, cu_bg,
+        hq_p, hkv_p, 64, 64, 4, 64, scale_p, False, True, False, False,
+    )
+    _, _, _, bt_div, _, _, _ = _ref_proj_conv_prep(
+        proj_bg.float(), cw_bg.float(), Alog_bg, dt_bg, None, [0, 4],
+        hq_p, hkv_p, 64, 64, 4, 64, scale_p, False, True,
+    )
+    _, _, _, bb_div, _, _, _ = _ref_proj_conv_prep(
+        proj_bg, cw_bg, Alog_bg, dt_bg, None, [0, 4],
+        hq_p, hkv_p, 64, 64, 4, 64, scale_p, False, True,
+    )
+    _dual_check(failures, tag_pc, "b_eff(mixed-warp div)", bk_div, bb_div, bt_div, lead_dims=2)
+
     # Check proj_conv_prep_bwd when beta_guard=False (exact PyTorch autograd match)
     dq_g = torch.randn_like(qk).float()
     dk_g = torch.randn_like(kk).float()

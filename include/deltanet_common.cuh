@@ -147,42 +147,49 @@ __device__ __forceinline__ void beta_guard_project_octet(
     float one_minus_a = 1.0f - a;
     float r2_crit = fmaxf((c2 - 1.0f) * (1.0f - (one_minus_a * one_minus_a) / fmaxf(c2, 1e-30f)), 0.0f);
 
-    if (n > 1e-20f && r2 > r2_crit) {
-        float mu = a / n;
-        float eta = sqrtf((1.0f - DELTANET_GUARD_MARGIN) * r2_crit / fmaxf(r2, 1e-30f));
-        eta = fminf(fmaxf(eta, 0.0f), 1.0f);
-
+    bool need_proj = (n > 1e-20f && r2 > r2_crit);
+    if (__any_sync(0xffffffff, need_proj)) {
         float cand[8];
         float local_aq = 0.0f;
         float local_nuq = 0.0f;
 
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            // Simulate FP16 quantization before re-testing contrast condition
-            float cq = __half2float(__float2half(mu + eta * (b_reg[i] - mu)));
-            cand[i] = cq;
-            float k2 = k_reg[i] * k_reg[i];
-            local_aq += cq * k2;
-            local_nuq += cq * cq * k2;
+        if (need_proj) {
+            float mu = a / n;
+            float eta = sqrtf((1.0f - DELTANET_GUARD_MARGIN) * r2_crit / fmaxf(r2, 1e-30f));
+            eta = fminf(fmaxf(eta, 0.0f), 1.0f);
+
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                // Simulate FP16 quantization before re-testing contrast condition
+                float cq = __half2float(__float2half(mu + eta * (b_reg[i] - mu)));
+                cand[i] = cq;
+                float k2 = k_reg[i] * k_reg[i];
+                local_aq += cq * k2;
+                local_nuq += cq * cq * k2;
+            }
         }
 
+        // All 32 warp lanes must stay converged for 0xffffffff shuffle reductions
         float a_q = octet_reduce_sum(local_aq);
         float nu_q = octet_reduce_sum(local_nuq);
-        float r2_q = fmaxf(n * nu_q - a_q * a_q, 0.0f);
-        float one_minus_aq = 1.0f - a_q;
-        float r2_crit_q = fmaxf((c2 - 1.0f) * (1.0f - (one_minus_aq * one_minus_aq) / fmaxf(c2, 1e-30f)), 0.0f);
-        float quant_tol = (DELTANET_GUARD_QUANT_TOL_MULT * DELTANET_FP16_EPS) * (n * nu_q + a_q * a_q);
 
-        if (r2_q > r2_crit_q + quant_tol) {
-            float mu_q = __half2float(__float2half(a_q / n));
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                b_reg[i] = mu_q;
-            }
-        } else {
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                b_reg[i] = cand[i];
+        if (need_proj) {
+            float r2_q = fmaxf(n * nu_q - a_q * a_q, 0.0f);
+            float one_minus_aq = 1.0f - a_q;
+            float r2_crit_q = fmaxf((c2 - 1.0f) * (1.0f - (one_minus_aq * one_minus_aq) / fmaxf(c2, 1e-30f)), 0.0f);
+            float quant_tol = (DELTANET_GUARD_QUANT_TOL_MULT * DELTANET_FP16_EPS) * (n * nu_q + a_q * a_q);
+
+            if (r2_q > r2_crit_q + quant_tol) {
+                float mu_q = __half2float(__float2half(a_q / n));
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    b_reg[i] = mu_q;
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    b_reg[i] = cand[i];
+                }
             }
         }
     }

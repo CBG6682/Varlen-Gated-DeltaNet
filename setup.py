@@ -198,8 +198,10 @@ if should_compile:
         os.path.join(THIS_DIR, "src", s)
         for s in [
             "binding.cpp",
-            "block_ops.cu",
-            "proj_conv_prep.cu",
+            "block_ops_fwd.cu",
+            "block_ops_bwd.cu",
+            "proj_conv_prep_fwd.cu",
+            "proj_conv_prep_bwd.cu",
             "chunk_wy_fwd.cu",
             "chunk_wy_bwd.cu",
             "chunk_scan_fwd.cu",

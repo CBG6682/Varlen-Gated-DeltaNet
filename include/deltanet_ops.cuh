@@ -18,7 +18,7 @@ struct VarlenChunkMeta {
 // DeltaNet v2 operator declarations (CuTe Tensor / SM75+).
 // Packed token-major DeltaBlock API + head-first core kernels with FP32 recurrent state.
 
-// 1. Block Ops (src/block_ops.cu)
+// 1. Block Ops (src/block_ops_fwd.cu, src/block_ops_bwd.cu)
 
 // Outputs: (out: (L, D) [FP16], rstd: (L,) [FP32] or empty when !is_training)
 std::tuple<at::Tensor, at::Tensor>
@@ -78,7 +78,7 @@ fused_residual_add_fwd(
     const at::Tensor& b            // (L, D) [FP16] - Second operand
 );
 
-// 2. Fused Projection Epilogue (src/proj_conv_prep.cu)
+// 2. Fused Projection Epilogue (src/proj_conv_prep_fwd.cu, src/proj_conv_prep_bwd.cu)
 
 // Outputs: (q_h, k_h, v_h, b_eff_h, w_h, G_log2_h [FP32], final_conv_state, q_inv_norm, k_inv_norm)
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
